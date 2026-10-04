@@ -1,0 +1,5 @@
+requests>=2.31
+eth-account>=0.13
+eth-abi>=5
+eth-utils>=4
+eth-keys>=0.5

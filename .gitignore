@@ -1,0 +1,14 @@
+# --- secrets: never commit ---
+*.env
+.env*
+!.env.example
+*.key
+*.pem
+secrets/
+.opensea/
+forkkey_*
+# --- runtime ---
+*.log
+__pycache__/
+*.pyc
+.venv/
