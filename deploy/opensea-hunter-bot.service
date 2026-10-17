@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenSea-Hunter Telegram mint service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/opensea-hunter
+EnvironmentFile=/root/osh-bot.env
+ExecStart=/opt/opensea-hunter/.venv/bin/python -m service.bot
+Restart=always
+RestartSec=5
+# mint children run in their own sessions and must survive a bot restart (they are re-attached by /proc)
+KillMode=process
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

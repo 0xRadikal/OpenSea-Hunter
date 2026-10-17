@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ساخت کلید API شخصی OpenSea</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>body{font-family:Tahoma,sans-serif;padding:16px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)}
+button{width:100%;padding:14px;font-size:16px;border:0;border-radius:10px;background:var(--tg-theme-button-color,#2481cc);color:var(--tg-theme-button-text-color,#fff)}
+pre{white-space:pre-wrap;direction:ltr;text-align:left}</style></head>
+<body>
+<h3>🔑 ساخت کلید API شخصی OpenSea</h3>
+<p>این صفحه از <b>اینترنت خود شما</b> یک کلید رایگان ۷ روزه از OpenSea می‌گیرد
+(<code>POST api.opensea.io/api/v2/auth/keys</code>) و مستقیم به ربات می‌فرستد.
+کلید فقط مال شماست و سهمیه‌اش با کسی تقسیم نمی‌شود. OpenSea برای هر IP روزانه حداکثر ۲ کلید می‌دهد.</p>
+<button id="go">ساخت کلید و ارسال به ربات</button>
+<pre id="out"></pre>
+<script>
+// Static page: no server, no analytics. The ONLY network call goes to api.opensea.io.
+const tg = window.Telegram && window.Telegram.WebApp; if (tg) tg.ready();
+const out = document.getElementById('out');
+document.getElementById('go').onclick = async () => {
+  out.textContent = '⏳ ...';
+  try {
+    const r = await fetch('https://api.opensea.io/api/v2/auth/keys', {method: 'POST'});
+    const j = await r.json();
+    if (!r.ok || !j.api_key) {
+      const ra = r.headers.get('retry-after');
+      out.textContent = 'خطا: ' + ((j.errors && j.errors[0]) || r.status) + (ra ? '\nزمان انتظار: ' + Math.ceil(ra/3600) + ' ساعت' : '');
+      return;
+    }
+    const payload = JSON.stringify({api_key: j.api_key, expires_at: j.expires_at});
+    if (tg && tg.sendData) { tg.sendData(payload); }      // closes the mini app; bot receives web_app_data
+    else { out.textContent = 'خارج از تلگرام باز شده. این متن را برای ربات بفرستید:\n' + payload; }
+  } catch (e) { out.textContent = 'خطای شبکه: ' + e; }
+};
+</script></body></html>

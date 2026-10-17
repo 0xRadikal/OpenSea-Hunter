@@ -96,6 +96,10 @@ Fork tests use a **throwaway wallet funded on the fork** and a mocked API. Nothi
 | `eip712.py`, `fork_helpers.py`, `fork.sh` | Test tooling |
 | `test_*.py`, `fixture_*` | Tests and real OpenSea calldata fixtures |
 
+## Telegram service
+
+See [SERVICE.md](SERVICE.md): a subscription bot that runs this engine per user, with each user's own OpenSea API key.
+
 ## Security
 
 * No secrets in the repository. Keys are read from files outside it (or from env vars), and the logger masks them.

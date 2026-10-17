@@ -14,7 +14,7 @@ def r(m,p):
 OWNER="0xc7a08eac09cd3f3a699f2b575052226faca3c8c1"; FEE="0x0000a26b00c1f0df003000390027140000faa719"
 ts=Account.create(); r("anvil_setTime",[int(time.time())]); r("evm_mine",[]); now=int(time.time())
 r("anvil_impersonateAccount",[OWNER]); r("anvil_setBalance",[OWNER,hex(10**18)])
-d="0x"+keccak(text="updateSignedMintValidationParams(address,address,(uint80,uint24,uint40,uint40,uint40,uint16,uint16))")[:4].hex()+encode(["address","address","(uint80,uint24,uint40,uint40,uint40,uint16,uint16)"],[b.SD,ts.address,(0,1000,now-3600,1791826200,1000,1000,1000)]).hex()
+d="0x"+keccak(text="updateSignedMintValidationParams(address,address,(uint80,uint24,uint40,uint40,uint40,uint16,uint16))")[:4].hex()+encode(["address","address","(uint80,uint24,uint40,uint40,uint40,uint16,uint16)"],[b.SD,ts.address,(0,1000,now-3600,now+30*86400,1000,1000,1000)]).hex()
 h=r("eth_sendTransaction",[{"from":OWNER,"to":b.NFT,"data":d,"gas":hex(500000)}]); time.sleep(1.5)
 from fork_helpers import throwaway_wallet
 KEYFILE, me = throwaway_wallet()

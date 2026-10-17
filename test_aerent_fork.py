@@ -25,7 +25,7 @@ now = int(r("eth_getBlockByNumber", ["latest", False])["timestamp"], 16)
 print("fork block ts", now, "wall", int(time.time()))
 # owner -> NFT.updateSignedMintValidationParams(seaDrop, signer, params)
 r("anvil_impersonateAccount", [OWNER]); r("anvil_setBalance", [OWNER, hex(10**18)])
-params = (0, 1000, now - 3600, 1791826200, 1000, 1000, 1000)
+params = (0, 1000, now - 3600, now + 30 * 86400, 1000, 1000, 1000)
 data = "0x" + keccak(text="updateSignedMintValidationParams(address,address,(uint80,uint24,uint40,uint40,uint40,uint16,uint16))")[:4].hex() + \
        encode(["address", "address", "(uint80,uint24,uint40,uint40,uint40,uint16,uint16)"], [b.SD, test_signer.address, params]).hex()
 h = r("eth_sendTransaction", [{"from": OWNER, "to": b.NFT, "data": data, "gas": hex(500000)}])
