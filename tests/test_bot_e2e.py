@@ -110,7 +110,9 @@ def test_full_flow(world):
     m = tg.mark(); tg.callback(U, w["reply_markup"]["inline_keyboard"][0][0]["callback_data"])
     rep = tg.wait_text(U, "تأیید می‌کنید", since=m, timeout=40)[1]["text"]
     assert "allowlist این مرحله هست" in rep
-    m = tg.mark(); tg.callback(U, "tok"); tg.wait_text(U, "ثبت شد", since=m)
+    m = tg.mark(); tg.callback(U, "tok"); tg.callback(U, "tok"); tg.callback(U, "tok")       # triple tap
+    tg.wait_text(U, "ثبت شد", since=m); time.sleep(1.0)
+    assert len(svc.db.tasks(U)) == 1, [dict(t) for t in svc.db.tasks(U)]
 
     # runner picks it up, engine mints at T0 on the fork, user gets notified
     tg.wait_text(U, "مینت انجام شد", timeout=150)
