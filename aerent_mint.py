@@ -441,7 +441,8 @@ def main():
 
     def ask(slot, _kidx, tag):
         s = api_sess[slot % len(api_sess)]
-        k = keys[active["k"]]
+        with lk:
+            k = keys[active["k"]]
         t = time.time()
         try:
             code, body, rem = api_mint(s, k, me)
@@ -509,7 +510,9 @@ def main():
         if "not currently active" in state["last_err"]:
             # Stage not open yet on OpenSea's side: do NOT burn the 5-call mint budget.
             # Poll the read endpoint (separate 600/h bucket) with 2 staggered threads until it flips.
-            if not wait_stage_active(read_api_sess, keys[active["k"]], win, T_END):
+            with lk:
+                rkey = keys[active["k"]]
+            if not wait_stage_active(read_api_sess, rkey, win, T_END):
                 log("stage never became active"); return
             with lk:
                 state["last_err"] = ""
@@ -581,6 +584,9 @@ def main():
         if rc:
             nonce += 1
         if "result" not in sim:
+            # Check balance before stopping - tx might have succeeded during timeout
+            if nft_balance(me) >= TARGET_HELD:
+                log("*** wallet holds the NFT (confirmed before stopping) ***"); return
             low = err.lower()
             # 0xc0e1b4c5 etc. are custom errors; stop on anything that will not change by retrying
             if any(x in low for x in ("exceeds", "maxsupply", "max_supply", "invalid signature", "signatureal", "notactive")):
