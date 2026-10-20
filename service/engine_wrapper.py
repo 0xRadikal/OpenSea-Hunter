@@ -5,7 +5,7 @@ Only module-level target constants are overridden (the same technique as run_tes
 mainnet). Secrets arrive as ONE JSON line on stdin -> never on argv, in env, or on disk:
     {"pk": "0x...", "api_key": "..."}
 The engine masks both in its log via its own _SECRETS list.
-Last stdout line:  OSH_RESULT {"holds": n, "target": m, "error": "..."}
+Last stdout line:  OSH_RESULT {"minted": bool, "tx": hash|null, "token_ids": [...], "reason": str|null, "error": str, "holds": n}
 """
 import argparse
 import importlib.util
@@ -47,7 +47,7 @@ def main():
         sec = json.loads(line)
         pk, api_key = sec["pk"], sec["api_key"]
     except Exception:
-        print('OSH_RESULT {"holds": -1, "target": -1, "error": "bad secret input"}', flush=True)
+        print('OSH_RESULT ' + json.dumps({"minted": False, "tx": None, "token_ids": [], "reason": "bad_input", "error": "bad secret input", "holds": -1}), flush=True)
         return 2
     del line, sec
 
@@ -65,13 +65,19 @@ def main():
 
     from eth_account import Account
     me = Account.from_key(pk).address
+
+    def emit(**kw):
+        out = {"minted": False, "tx": None, "token_ids": [], "reason": None, "error": "", "holds": -1}
+        out.update(kw)
+        print("OSH_RESULT " + json.dumps(out), flush=True)
+
     held = bot.nft_balance(me)
     if held < 0:
-        print('OSH_RESULT {"holds": -1, "target": -1, "error": "cannot read NFT balance"}', flush=True)
+        emit(reason="rpc_unavailable", error="cannot read NFT balance")
         return 3
     bot.TARGET_HELD = held + 1           # mint exactly one more than the wallet holds now
 
-    argv = ["aerent_mint.py"] + ([] if a.dry_run else ["--arm"])
+    argv = ["mint_engine.py"] + ([] if a.dry_run else ["--arm"])
     for u in a.rpc or []:
         argv += ["--send-rpc", u, "--read-rpc", u]
     if a.no_api_check:
@@ -84,8 +90,11 @@ def main():
         err = bot.mask(str(e)) if e.code not in (0, None) else ""
     except BaseException as e:  # noqa: BLE001 — report and exit
         err = bot.mask(f"{type(e).__name__}: {str(e)[:160]}")
-    holds = bot.nft_balance(me)
-    print("OSH_RESULT " + json.dumps({"holds": holds, "target": bot.TARGET_HELD, "error": err}), flush=True)
+    r = dict(bot.RESULT)
+    if not r["minted"] and not r["reason"]:
+        r["reason"] = "error" if err else "not_minted"
+    emit(minted=r["minted"], tx=r["tx"], token_ids=r["token_ids"], reason=r["reason"], error=err,
+         holds=bot.nft_balance(me))
     return 0
 
 

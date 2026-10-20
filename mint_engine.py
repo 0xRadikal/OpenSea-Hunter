@@ -66,6 +66,8 @@ SEL_SIGNED = "0x" + keccak(text="mintSigned(address,address,address,uint256,(uin
 SEL_PUBLIC = "0x" + keccak(text="mintPublic(address,address,address,uint256)")[:4].hex()
 
 _SECRETS = []
+RESULT = {"minted": False, "tx": None, "token_ids": [], "reason": None}   # filled by main(); read by the wrapper
+TRANSFER_TOPIC = "0x" + keccak(text="Transfer(address,address,uint256)").hex().removeprefix("0x")
 _plock = threading.Lock()
 
 
@@ -249,6 +251,27 @@ def rr(method, params, tries=8):
     raise RuntimeError(f"{method} failed on all RPCs: {str(last)[:80]}")
 
 
+def minted_token_ids(rc, me):
+    """Token ids transferred FROM 0x0 TO `me` by NFT in this receipt (ERC-721 Transfer log)."""
+    out = []
+    for lg in (rc or {}).get("logs") or []:
+        t = [x.lower() for x in lg.get("topics") or []]
+        if (lg.get("address") or "").lower() == NFT.lower() and len(t) == 4 and t[0] == TRANSFER_TOPIC \
+                and int(t[1], 16) == 0 and int(t[2], 16) == int(me, 16):
+            out.append(int(t[3], 16))
+    return out
+
+
+def minted_count_onchain(me):
+    """SeaDrop-counted mints of `me` on NFT (getMintStats -> minterNumMinted); -1 if unknown."""
+    sel = "0x" + keccak(text="getMintStats(address)")[:4].hex()
+    try:
+        x = rr("eth_call", [{"to": NFT, "data": sel + me[2:].lower().rjust(64, "0")}, "latest"], tries=3)
+        return int(x[2:66], 16)
+    except Exception:
+        return -1
+
+
 def nft_balance(me):
     try:
         return int(rr("eth_call", [{"to": NFT, "data": "0x70a08231" + me[2:].lower().rjust(64, "0")}, "latest"], tries=3), 16)
@@ -288,11 +311,15 @@ def l1_component_estimate(n_bytes=584):
     return int(x[:64], 16)
 
 
-def onchain_public_price():
-    """(mintPrice, startTime, endTime) from SeaDrop.getPublicDrop(NFT)."""
+def onchain_public_drop():
+    """(mintPrice, startTime, endTime, maxTotalMintableByWallet) from SeaDrop.getPublicDrop(NFT)."""
     sel = "0x" + keccak(text="getPublicDrop(address)")[:4].hex()
     x = rr("eth_call", [{"to": SD, "data": sel + NFT[2:].lower().rjust(64, "0")}, "latest"], tries=3)[2:]
-    return int(x[0:64], 16), int(x[64:128], 16), int(x[128:192], 16)
+    return int(x[0:64], 16), int(x[64:128], 16), int(x[128:192], 16), int(x[192:256], 16)
+
+
+def onchain_public_price():
+    return onchain_public_drop()[:3]
 
 
 def api_stage_times(apikey):
@@ -402,13 +429,19 @@ def main():
     if MINT_KIND not in ("signed", "public") or EXPECTED_PRICE < 0 or EXPECTED_PRICE > MAX_VALUE_WEI:
         raise SystemExit("bad mint policy")
 
-    if int(rpc("eth_chainId", [])["result"], 16) != CHAIN_ID:
+    if int(rr("eth_chainId", []), 16) != CHAIN_ID:
         raise SystemExit("wrong chain")
-    if rpc("eth_getCode", [me, "latest"])["result"] not in ("0x", "0x0"):
+    if rr("eth_getCode", [me, "latest"]) not in ("0x", "0x0"):
         raise SystemExit("wallet is a contract account")
     if nft_balance(me) >= TARGET_HELD:
         log("wallet already holds the target amount — nothing to do"); return
 
+    if MINT_KIND == "public":
+        p_, _s, _e, limit = onchain_public_drop()
+        done = minted_count_onchain(me)
+        if limit and done >= 0 and done >= limit:
+            RESULT["reason"] = "wallet_limit"
+            log(f"wallet already minted {done}/{limit} (on-chain per-wallet limit) — nothing to do"); return
     T0, T_END = (a.start, a.start + 3600) if a.start else (STAGE_START, STAGE_END)
     if not a.no_api_check:
         s0, e0, st, d = api_stage_times(keys[0])
@@ -547,11 +580,13 @@ def main():
             log("API returned calldata that failed validation — stopping for safety"); return
         if state.get("limit_hit"):
             if nft_balance(me) >= TARGET_HELD:
+                RESULT["reason"] = "wallet_limit"
                 log("*** wallet already holds the NFT (API: wallet limit reached) ***"); return
             state["limit_hit"] = False
         if state["not_on_list"] >= 3:
             if not state.get("warned"):
                 state["warned"] = True
+                RESULT["reason"] = "not_eligible"          # cleared again if a mint later succeeds
                 log("!! OpenSea says this wallet is NOT on the OG List allowlist (3x). No gas spent. "
                     "Switching to slow re-check every 20 s in case it was a transient backend error.")
             if win.wait(20):
@@ -603,12 +638,25 @@ def main():
         return
 
     broadcasts = 0
+    sent_hashes = []
+
+    def settle_from_receipts(why):
+        """Any of our txs mined with a Transfer to me? Authoritative success (independent of balanceOf lag)."""
+        for hh in sent_hashes:
+            r_ = wait_receipt(hh, read_sess, timeout=3)
+            if r_ and int(r_["status"], 16) == 1 and minted_token_ids(r_, me):
+                RESULT.update(minted=True, tx=hh, token_ids=minted_token_ids(r_, me), reason=None)
+                log(f"*** MINTED *** ({why}) token ids {RESULT['token_ids']} | tx {hh}")
+                return True
+        return False
+
     while broadcasts < MAX_BROADCASTS and time.time() < en_:
         signed = acct.sign_transaction({"to": to_checksum_address(SD), "value": VALUE, "data": tx["data"], "nonce": nonce,
                                         "chainId": CHAIN_ID, "gas": gas, "type": 2,
                                         "maxFeePerGas": max_fee, "maxPriorityFeePerGas": PRIO})
         raw = signed.raw_transaction.to_0x_hex()
         h = "0x" + signed.hash.hex().removeprefix("0x")
+        sent_hashes.append(h)
         res = broadcast(raw, send_sess)
         broadcasts += 1
         log(f"SENT #{broadcasts} nonce {nonce} {h} (T0+{(time.time()-T0)*1000:.0f} ms) | " +
@@ -616,7 +664,7 @@ def main():
         if not any(accepted(r) for r in res.values()):
             msgs = json.dumps(res).lower()
             if "nonce too low" in msgs:
-                if nft_balance(me) >= TARGET_HELD:
+                if settle_from_receipts("nonce consumed") or nft_balance(me) >= TARGET_HELD:
                     log("*** wallet holds the NFT ***"); return
                 try:
                     nonce = int(rr("eth_getTransactionCount", [me, "pending"]), 16)
@@ -626,9 +674,12 @@ def main():
             time.sleep(0.15); continue
         rc = wait_receipt(h, read_sess)
         if rc and int(rc["status"], 16) == 1:
-            log(f"*** MINTED *** block {int(rc['blockNumber'],16)} idx {int(rc['transactionIndex'],16)} gasUsed {int(rc['gasUsed'],16)} | holds {nft_balance(me)}")
+            ids = minted_token_ids(rc, me)
+            RESULT.update(minted=bool(ids), tx=h, token_ids=ids, reason=None if ids else "no_transfer_in_receipt")
+            log(f"*** MINTED *** block {int(rc['blockNumber'],16)} idx {int(rc['transactionIndex'],16)} gasUsed {int(rc['gasUsed'],16)} "
+                f"| token ids {ids} | tx {h}")
             return
-        if nft_balance(me) >= TARGET_HELD:
+        if settle_from_receipts("after receipt wait") or nft_balance(me) >= TARGET_HELD:
             log("*** wallet holds the NFT ***"); return
         try:
             sim = rpc("eth_call", [{"from": me, "to": SD, "data": tx["data"], "value": hex(VALUE)}, "latest"])
@@ -642,13 +693,14 @@ def main():
             nonce += 1
         if "result" not in sim:
             # Check balance before stopping - tx might have succeeded during timeout
-            if nft_balance(me) >= TARGET_HELD:
+            if settle_from_receipts("before stopping") or nft_balance(me) >= TARGET_HELD:
                 log("*** wallet holds the NFT (confirmed before stopping) ***"); return
             low = err.lower()
             # 0xc0e1b4c5 etc. are custom errors; stop on anything that will not change by retrying
             if any(x in low for x in ("exceeds", "maxsupply", "max_supply", "invalid signature", "signatureal", "notactive")):
                 log("revert reason will not fix itself — stopping."); return
             log("unknown revert — stopping to avoid burning gas."); return
+    settle_from_receipts("final check")
     log(f"stopped. holds={nft_balance(me)}")
 
 

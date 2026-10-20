@@ -118,6 +118,29 @@ def nft_balance(nft, address, rpcs=None):
     return int(rpc("eth_call", [{"to": nft, "data": "0x70a08231" + address[2:].lower().rjust(64, "0")}, "latest"], rpcs), 16)
 
 
-def onchain_public_price(nft, rpcs=None):
+def onchain_public_drop(nft, rpcs=None):
+    """SeaDrop.getPublicDrop(nft) -> (mintPrice, startTime, endTime, maxTotalMintableByWallet)."""
     res = rpc("eth_call", [{"to": SD, "data": "0x" + _sel("getPublicDrop(address)") + nft[2:].lower().rjust(64, "0")}, "latest"], rpcs)
+    if len(res) < 2 + 64 * 4:
+        raise PreflightError("پاسخ getPublicDrop نامعتبر است")
+    w = [int(res[2 + 64 * i: 2 + 64 * (i + 1)], 16) for i in range(4)]
+    return w[0], w[1], w[2], w[3]
+
+
+def onchain_public_price(nft, rpcs=None):
+    return onchain_public_drop(nft, rpcs)[0]
+
+
+def minted_count(nft, address, rpcs=None):
+    """How many tokens SeaDrop already counts for this wallet (NFT.getMintStats -> minterNumMinted).
+    This is exactly what SeaDrop compares against maxTotalMintableByWallet, across ALL stages."""
+    res = rpc("eth_call", [{"to": nft, "data": "0x" + _sel("getMintStats(address)") + address[2:].lower().rjust(64, "0")}, "latest"], rpcs)
+    if len(res) < 2 + 64:
+        raise PreflightError("پاسخ getMintStats نامعتبر است")
     return int(res[2:66], 16)
+
+
+def stage_wallet_limit(st):
+    """Per-wallet limit from the OpenSea stage (int) or None if absent/unparseable."""
+    v = str(st.get("max_per_wallet") if st.get("max_per_wallet") is not None else "")
+    return int(v) if v.isdigit() else None

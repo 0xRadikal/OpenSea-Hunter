@@ -9,6 +9,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 
 from telegram import (InlineKeyboardButton as IB, InlineKeyboardMarkup as IM, KeyboardButton, LabeledPrice,
@@ -50,13 +51,17 @@ class Service:
         self.os = OpenSea(cfg.opensea_base)
         self.loop = None
         self.app = None
-        self.runner = Runner(self.db, self.vault, cfg, self.notify, extra_runner_args)
+        self.runner = Runner(self.db, self.vault, cfg, self.notify, extra_runner_args, admin_notify=self.notify_admins)
 
     # ------------------------------------------------------------------ infra
     def notify(self, uid, text):
         """Thread-safe (runner runs in an executor thread)."""
         if self.loop and self.app:
             asyncio.run_coroutine_threadsafe(self._send(uid, text), self.loop)
+
+    def notify_admins(self, text):
+        for a in self.cfg.admin_ids:
+            self.notify(a, text)
 
     async def _send(self, uid, text):
         try:
@@ -292,12 +297,29 @@ class Service:
         c.user_data["state"] = "await_link"
         await u.message.reply_text("🔗 لینک کالکشن OpenSea (یا slug) را بفرستید.\nمثال: https://opensea.io/collection/aerent")
 
+    @staticmethod
+    def extract_link(text):
+        """The OpenSea link/slug inside the user's message, or None. Accepts a bare slug, a bare link, or a
+        longer pasted/forwarded text that contains exactly one opensea.io link."""
+        t = (text or "").strip()
+        if not t:
+            return None
+        if not any(ch.isspace() for ch in t):
+            return t
+        links = set(re.findall(r"(?:https?://)?(?:www\.)?opensea\.io/[^\s<>\"']+", t, flags=re.I))
+        return links.pop() if len(links) == 1 else None
+
     async def got_link(self, u: Update, c):
         uid = u.effective_user.id
+        link = self.extract_link(u.message.text)
+        if not link:
+            return await u.message.reply_text(
+                "این پیام لینک کالکشن نیست. فقط لینک را بفرستید، مثل:\nhttps://opensea.io/collection/aerent\n"
+                "(یا فقط slug مثل aerent — برای انصراف /cancel)")
         msg = await u.message.reply_text("⏳ در حال بررسی دراپ…")
         try:
             key = self.user_key(uid)
-            slug = await self.blocking(self.os.resolve_slug, u.message.text, key)
+            slug = await self.blocking(self.os.resolve_slug, link, key)
             drop = await self.blocking(self.os.drop, slug, key)
             nft = pf.check_drop(drop)
             await self.blocking(pf.check_chain_contract, nft)
@@ -360,15 +382,28 @@ class Service:
             report.append(f"ℹ️ این ولت الان {held} عدد از این NFT دارد (ربات دقیقاً ۱ عدد دیگر مینت می‌کند)")
         except pf.PreflightError as e:
             return await m.edit_text(f"❌ {e}")
+        # per-wallet limit: SeaDrop refuses if minted_so_far + 1 > limit (counted across all stages)
+        limit = pf.stage_wallet_limit(st)
         if st["kind"] == "public":
-            if price > 0:
-                try:
-                    onchain = await self.blocking(pf.onchain_public_price, nft)
-                    if onchain != price:
-                        ok = False
-                        report.append(f"❌ قیمت روی زنجیره ({onchain / 1e18:.6f}) با OpenSea ({price / 1e18:.6f}) فرق دارد")
-                except pf.PreflightError as e:
-                    report.append(f"⚠️ خواندن قیمت روی زنجیره ممکن نشد ({esc(str(e)[:60])}); قبل از ارسال دوباره چک می‌شود")
+            try:
+                onchain_price, _s, _e, onchain_limit = await self.blocking(pf.onchain_public_drop, nft)
+                limit = onchain_limit                      # on-chain value is what the contract enforces
+                if price > 0 and onchain_price != price:
+                    ok = False
+                    report.append(f"❌ قیمت روی زنجیره ({onchain_price / 1e18:.6f}) با OpenSea ({price / 1e18:.6f}) فرق دارد")
+            except pf.PreflightError as e:
+                report.append(f"⚠️ خواندن تنظیمات مرحله از زنجیره ممکن نشد ({esc(str(e)[:60])}); قبل از ارسال دوباره چک می‌شود")
+        try:
+            done = await self.blocking(pf.minted_count, nft, w["address"])
+            if limit:
+                if done >= limit:
+                    ok = False
+                    report.append(f"❌ این ولت به سقف مینت این مرحله رسیده ({done} از {limit}). مینت بیشتر ممکن نیست.")
+                else:
+                    report.append(f"✅ سقف هر ولت: {done} از {limit} مینت شده")
+        except pf.PreflightError as e:
+            report.append(f"⚠️ تعداد مینت‌های قبلی این ولت خوانده نشد ({esc(str(e)[:60])}); قبل از ارسال دوباره چک می‌شود")
+        if st["kind"] == "public":
             report.append("ℹ️ مرحلهٔ عمومی: allowlist ندارد")
         else:
             try:
@@ -452,12 +487,22 @@ class Service:
         if st == "await_pk":                    # checked FIRST: a key message must never be echoed/routed
             return await self.got_pk(u, c)
         if t in routes:
-            c.user_data.pop("state", None)
+            for k in ("state", "confirm", "stage", "stages", "slug", "nft"):   # leaving the task flow
+                c.user_data.pop(k, None)
             return await routes[t](u, c)
         if st == "await_key":
             return await self.got_key(u, c)
         if st == "await_link":
             return await self.got_link(u, c)
+        d = c.user_data
+        if d.get("confirm"):                   # a task is waiting for ✅ / ✖️
+            return await u.message.reply_text(
+                "تسک هنوز ثبت نشده. برای ثبت روی «✅ ثبت تسک» و برای لغو روی «✖️ انصراف» زیر پیام پیش‌بررسی بزنید "
+                "(یا /cancel).\nℹ️ هر تسک دقیقاً ۱ عدد مینت می‌کند؛ برای عدد بیشتر بعد از مینت تسک جدید بسازید.")
+        if d.get("stage"):
+            return await u.message.reply_text("ولت را از دکمه‌های پیام قبلی انتخاب کنید (یا /cancel).")
+        if d.get("stages"):
+            return await u.message.reply_text("مرحله را از دکمه‌های پیام قبلی انتخاب کنید (یا /cancel).")
         # a pasted private key outside the flow: delete it anyway
         if len(t) in (64, 66) and all(ch in "0123456789abcdefABCDEFx" for ch in t):
             try:

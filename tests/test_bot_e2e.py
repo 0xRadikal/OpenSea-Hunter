@@ -161,6 +161,27 @@ def test_full_flow(world):
     pt = [t for t in svc.db.tasks(U) if t["slug"] == pslug][0]
     assert pt["kind"] == "public" and pt["price_wei"] == str(P) and pt["max_value_wei"] == str(P)
 
+    # ---- typing while the ✅/✖️ confirm is pending gets a clear answer (live bug: "از منو استفاده کنید")
+    fu.set_public_drop(P, now - 60, now + 3600, max_per_wallet=5)
+    m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
+    m = tg.mark(); tg.text(U, "🎯 e2e-paid / Public stage (عمومی)\nشروع: x")             # pasted bot text, not a link
+    tg.wait_text(U, "این پیام لینک کالکشن نیست", since=m)
+    m = tg.mark(); tg.text(U, pslug); tg.wait_text(U, "مرحله را انتخاب کنید", since=m)
+    m = tg.mark(); tg.text(U, "2"); tg.wait_text(U, "مرحله را از دکمه", since=m)
+    m = tg.mark(); tg.callback(U, "st:0"); tg.wait_text(U, "ولت را انتخاب کنید", since=m)
+    m = tg.mark(); tg.callback(U, btn); rep_ = tg.wait_text(U, "تأیید می‌کنید", since=m, timeout=40)[1]["text"]
+    assert "سقف هر ولت: 1 از 5" in rep_
+    m = tg.mark(); tg.text(U, "2"); tg.wait_text(U, "تسک هنوز ثبت نشده", since=m)
+    m = tg.mark(); tg.callback(U, "tno"); tg.wait_text(U, "لغو شد", since=m)
+    # ---- wallet already at the on-chain per-wallet limit -> refused BEFORE a task exists (live task #3)
+    fu.set_public_drop(P, now - 60, now + 3600, max_per_wallet=1)
+    n_tasks = len(svc.db.tasks(U))
+    m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
+    m = tg.mark(); tg.text(U, pslug); tg.wait_text(U, "مرحله را انتخاب کنید", since=m)
+    m = tg.mark(); tg.callback(U, "st:0"); tg.wait_text(U, "ولت را انتخاب کنید", since=m)
+    m = tg.mark(); tg.callback(U, btn); rep_ = tg.wait_text(U, "تسک ساخته نشد", since=m, timeout=40)[1]["text"]
+    assert "به سقف مینت این مرحله رسیده (1 از 1)" in rep_
+    assert len(svc.db.tasks(U)) == n_tasks
     # ---- group chats are ignored entirely
     m = tg.mark()
     tg._push({"message": {"message_id": 1, "date": int(time.time()), "chat": {"id": -100, "type": "supergroup"},

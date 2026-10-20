@@ -54,19 +54,51 @@ def pid_is_task(pid, tid):
     return any(x.endswith("engine_wrapper.py") for x in s) and "--task-id" in s and s[s.index("--task-id") + 1] == str(tid)
 
 
-def classify(res):
-    """-> (status, human detail)"""
+REASONS = {
+    "wallet_limit": "این ولت به سقف مینتِ هر ولت در این مرحله رسیده است",
+    "not_eligible": "این ولت در allowlist این مرحله نیست",
+    "rpc_unavailable": "اتصال به شبکه برقرار نشد؛ دوباره تلاش کنید",
+    "bad_input": "خطای داخلی (به ادمین گزارش شد)",
+    "no_transfer_in_receipt": "تراکنش ثبت شد ولی NFTی به این ولت منتقل نشد",
+}
+HINTS = (
+    ("does not cover mint price", "موجودی ولت برای قیمت مینت کافی نیست"),
+    ("too low for safe gas", "موجودی ولت برای گس کافی نیست"),
+    ("stage price", "قیمت مرحله با قیمتی که تأیید کرده بودید فرق دارد؛ چیزی ارسال نشد"),
+    ("on-chain public price", "قیمت روی زنجیره با قیمت تأییدشده فرق دارد؛ چیزی ارسال نشد"),
+    ("not found in API", "این مرحله دیگر در OpenSea وجود ندارد"),
+    ("wrong chain", "شبکهٔ RPC اشتباه است"),
+    ("contract account", "ولت قرارداد هوشمند است"),
+    ("stage ended without", "مرحله تمام شد و OpenSea امضا نداد"),
+    ("NOT on the", "این ولت در allowlist این مرحله نیست"),
+    ("REFUSED", "پاسخ OpenSea با شرایط تأییدشده جور نبود؛ برای امنیت چیزی ارسال نشد"),
+    ("REVERTED", "تراکنش روی زنجیره رد شد"),
+    ("stage never became active", "مرحله فعال نشد"),
+)
+
+
+def classify(res, log_tail=""):
+    """-> (status, user message). Raw Python errors are never shown to the user."""
     if not res:
-        return "failed", "خروجی نامشخص (پروسه بدون نتیجه پایان یافت)"
-    if res.get("target", -1) > 0 and res.get("holds", -1) >= res["target"]:
-        return "minted", "مینت انجام شد"
-    err = res.get("error") or ""
-    return "failed", err or "مینت انجام نشد (جزئیات در لاگ)"
+        return "failed", "پروسهٔ مینت بدون نتیجه تمام شد (به ادمین گزارش شد)"
+    if res.get("minted"):
+        ids = res.get("token_ids") or []
+        m = "مینت انجام شد" + (f" — توکن #{', #'.join(map(str, ids))}" if ids else "")
+        return "minted", m + (f"\ntx: {res['tx']}" if res.get("tx") else "")
+    reason = res.get("reason")
+    if reason in REASONS:
+        return ("not_eligible" if reason == "not_eligible" else "failed"), REASONS[reason]
+    text = (res.get("error") or "") + "\n" + (log_tail or "")
+    for needle, msg in HINTS:
+        if needle in text:
+            return "failed", msg
+    return "failed", "مینت انجام نشد (به ادمین گزارش شد)"
 
 
 class Runner:
-    def __init__(self, db, vault, cfg, notify, extra_args=None):
+    def __init__(self, db, vault, cfg, notify, extra_args=None, admin_notify=None):
         self.db, self.vault, self.cfg, self.notify = db, vault, cfg, notify
+        self.admin_notify = admin_notify
         self.extra_args = list(extra_args or [])    # tests only (fork RPC / fake OpenSea)
         self.procs = {}                              # tid -> Popen (only for children we spawned)
         os.makedirs(cfg.log_dir, mode=0o700, exist_ok=True)
@@ -121,14 +153,14 @@ class Runner:
         return True
 
     def _finish(self, t, status, detail):
-        self.db.update_task(t["id"], status=status, result=detail[:400])
+        res = parse_result(self.log_path(t["id"])) or {}
+        self.db.update_task(t["id"], status=status, result=detail[:400], tx_hash=res.get("tx"))
         self.procs.pop(t["id"], None)
-        tail = "\n".join(last_lines(self.log_path(t["id"]))) if status != "minted" else ""
-        icon = {"minted": "✅", "failed": "❌", "ended": "⌛", "cancelled": "🚫"}.get(status, "ℹ️")
-        msg = f"{icon} تسک #{t['id']} ({t['slug']} / {t['stage_label']}): {detail}"
-        if tail:
-            msg += "\n\nآخرین لاگ:\n" + tail[-1500:]
-        self.notify(t["user_id"], msg)
+        icon = {"minted": "✅", "failed": "❌", "ended": "⌛", "cancelled": "🚫", "not_eligible": "⛔"}.get(status, "ℹ️")
+        self.notify(t["user_id"], f"{icon} تسک #{t['id']} ({t['slug']} / {t['stage_label']}): {detail}")
+        if status not in ("minted", "cancelled") and self.admin_notify:      # raw log goes to admins only
+            tail = "\n".join(last_lines(self.log_path(t["id"]), 8))
+            self.admin_notify(f"[task #{t['id']} user {t['user_id']} -> {status}] {detail}\n{tail[-1500:]}")
 
     # ------------------------------------------------------------------ main loop
     def tick(self, now=None):
@@ -157,7 +189,7 @@ class Runner:
                 alive = (p.poll() is None) if p else (bool(t["pid"]) and pid_is_task(t["pid"], tid))
                 if alive:
                     continue
-                st, detail = classify(parse_result(self.log_path(tid)))
+                st, detail = classify(parse_result(self.log_path(tid)), "\n".join(last_lines(self.log_path(tid), 40)))
                 self._finish(t, st, detail)
 
     def _pre_warn(self, t):

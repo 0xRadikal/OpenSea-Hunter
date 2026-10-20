@@ -35,7 +35,7 @@ def test_mint_and_secret_hygiene(env):
     fo.mint["s1"] = mint; fo.drops["s1"] = {"stages": [{"label": "OG List", "uuid": "u"}]}; fo.active_after["s1"] = 0
     p, res = run_wrapper(fo, pk, "s1", time.time() + 4)
     out = p.stdout + p.stderr
-    assert res and res["holds"] == 1 and res["target"] == 1, out[-2000:]
+    assert res and res["minted"] is True and res["holds"] == 1 and res["tx"] and len(res["token_ids"]) == 1, out[-2000:]
     assert "MINTED" in out
     assert pk[2:] not in out and pk not in out and "k" * 32 not in out            # secrets masked in log
     assert fu.holds(a.address) == 1
@@ -48,14 +48,14 @@ def test_public_calldata_refused_zero_tx(env):
     pub = "0x" + keccak(text="mintPublic(address,address,address,uint256)")[:4].hex() + encode(["address","address","address","uint256"], [fu.NFT, fu.FEE, "0x"+"0"*40, 1]).hex()
     fo.mint["s2"] = lambda m: (200, {"to": fu.SD, "data": pub, "value": str(10**17), "chain": "robinhood"})
     p, res = run_wrapper(fo, pk, "s2", time.time() + 4)
-    assert res and res["holds"] == 0
+    assert res and res["minted"] is False and res["holds"] == 0 and res["tx"] is None
     assert int(fu.r("eth_getTransactionCount", [a.address, "latest"]), 16) == 0
     assert "REFUSED" in p.stdout
 
 def test_bad_secret_input(env):
     _, fo = env
     p, res = run_wrapper(fo, "", "s1", time.time() + 4, secret="garbage")
-    assert res == {"holds": -1, "target": -1, "error": "bad secret input"}
+    assert res == {"minted": False, "tx": None, "token_ids": [], "reason": "bad_input", "error": "bad secret input", "holds": -1}
 
 def test_dry_run_never_broadcasts(env):
     ts, fo = env
@@ -64,4 +64,4 @@ def test_dry_run_never_broadcasts(env):
     fo.mint["s3"] = lambda m: (200, {"to": fu.SD, "data": cd, "value": "0", "chain": "robinhood"})
     p, res = run_wrapper(fo, pk, "s3", time.time() + 4, extra=["--dry-run"])
     assert "DRY-RUN: eth_call -> OK" in p.stdout, p.stdout[-1500:]
-    assert int(fu.r("eth_getTransactionCount", [a.address, "latest"]), 16) == 0 and res["holds"] == 0
+    assert int(fu.r("eth_getTransactionCount", [a.address, "latest"]), 16) == 0 and res["holds"] == 0 and res["minted"] is False
