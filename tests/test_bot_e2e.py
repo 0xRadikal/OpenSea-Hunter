@@ -173,6 +173,20 @@ def test_full_flow(world):
                                           "value": "0", "chain": "robinhood"}) if q == 2 else
                                    (200, {"to": fu.SD, "data": fu.public_calldata(m, q), "value": str(P * q), "chain": "robinhood"}))
     add_wallet(tg, U, pkc)
+    # second API key -> each concurrent stage gets its OWN key; same key twice is deduplicated
+    fo.valid_keys.add("q" * 32)
+    m = tg.mark(); tg.webapp(U, json.dumps({"api_key": "q" * 32, "expires_at": iso(time.time() + 7 * 86400)}))
+    tg.wait_text(U, "کلیدهای معتبر شما: 2", since=m)
+    m = tg.mark(); tg.webapp(U, json.dumps({"api_key": "q" * 32, "expires_at": iso(time.time() + 7 * 86400)}))
+    tg.wait_text(U, "قبلاً ثبت شده", since=m)
+    m = tg.mark(); tg.text(U, "🔑 کلید API"); km = tg.wait_text(U, "کلیدهای API شخصی", since=m)[1]["text"]
+    assert km.count("🟢") == 2
+    # settings: price policy -> cap +25% (only affects plans armed from now on)
+    m = tg.mark(); tg.text(U, "⚙️ تنظیمات"); st_ = tg.wait_text(U, "واکنش به تغییر قیمت", since=m)[1]
+    assert "فقط با همان قیمت" in st_["text"] and "سقف تسک فعال: 20" in st_["text"]
+    m = tg.mark(); tg.callback(U, "cp:cap"); st_ = tg.wait_text(U, "تا سقف افزایش مشخص", since=m)[1]
+    m = tg.mark(); tg.callback(U, "cpp:25"); tg.wait_text(U, "سقف +25٪", since=m)
+    assert svc.db.prefs(U) == {"user_id": U, "price_policy": "cap", "max_increase_pct": 25}
     m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
     m = tg.mark(); tg.text(U, "check this https://opensea.io/collection/e2e-paid/overview please")   # link inside text
     msg = tg.wait_text(U, "با کدام ولت", since=m)[1]
@@ -193,17 +207,27 @@ def test_full_flow(world):
     m = tg.mark(); tg.callback(U, btn_by(qm, "3")); sel = tg.wait_text(U, "انتخاب شما: <b>3 عدد</b>", since=m)[1]
     m = tg.mark(); tg.callback(U, "pn"); summ = tg.wait_text(U, "خلاصهٔ برنامهٔ مینت", since=m)[1]["text"]
     assert "0.001000 × 3 = 0.003000 ETH" in summ and "تعداد: <b>2</b>" in summ and "رایگان" in summ
+    assert "قیمت قابل‌قبول هر عدد: 0.001000 تا 0.001250 ETH" in summ and "سقف +25٪" in summ
+    assert "کلید هر مرحله" in summ and "کلید مشترک" not in summ
     m = tg.mark(); tg.text(U, "ok"); tg.wait_text(U, "برنامه هنوز ثبت نشده", since=m)
     b0 = fu.eth(c_.address)
     m = tg.mark(); tg.callback(U, "pa"); arm = tg.wait_text(U, "مسلح شد", since=m)[1]["text"]
     assert "Allowlist × 2" in arm and "Public stage × 3" in arm
-    tg.wait_text(U, "مینت انجام شد — 2 عدد", timeout=150, since=m)
-    tg.wait_text(U, "مینت انجام شد — 3 عدد", timeout=150, since=m)
+    done2 = tg.wait_text(U, "مینت انجام شد — 2 عدد", timeout=150, since=m)[1]["text"]
+    done3 = tg.wait_text(U, "مینت انجام شد — 3 عدد", timeout=150, since=m)[1]["text"]
+    for d in (done2, done3):
+        assert "⚡ سرعت" in d and "ارسال تراکنش" in d and "رتبهٔ ما" in d, d
+    assert "قیمت پرداختی هر عدد: 0.001000 ETH" in done3
     assert fu.holds(c_.address) == 5 and 3 * P <= b0 - fu.eth(c_.address) < 3 * P + 2 * 10 ** 14
     pts = sorted([t for t in svc.db.tasks(U) if t["slug"] == pslug], key=lambda t: t["id"])
     assert [(t["stage_label"], t["quantity"], t["kind"], t["status"]) for t in pts] == \
         [("Allowlist", 2, "signed", "minted"), ("Public stage", 3, "public", "minted")]
-    assert pts[1]["price_wei"] == str(P) and pts[1]["max_value_wei"] == str(3 * P) and pts[0]["plan_id"] == pts[1]["plan_id"]
+    assert pts[1]["price_wei"] == str(P) and pts[1]["max_value_wei"] == str(3 * P * 5 // 4) and pts[0]["plan_id"] == pts[1]["plan_id"]
+    assert pts[1]["price_policy"] == "cap" and pts[1]["max_unit_wei"] == str(P * 5 // 4) and pts[1]["min_unit_wei"] == str(P)
+    assert pts[0]["apikey_id"] != pts[1]["apikey_id"] and None not in (pts[0]["apikey_id"], pts[1]["apikey_id"])
+    used = {(b["quantity"], b["_key"]) for b in fo.mint_bodies if b["_slug"] == pslug}
+    assert {k for q_, k in used if q_ == 2} and {k for q_, k in used if q_ == 3}
+    assert not ({k for q_, k in used if q_ == 2} & {k for q_, k in used if q_ == 3}), used   # really different keys
 
     # ---- cumulative wallet limit: the wallet holds 5 now; with limit 5 everything is shown as full, nothing armable
     fu.set_public_drop(P, now - 60, now + 3600, max_per_wallet=5)
@@ -224,6 +248,10 @@ def test_full_flow(world):
     assert not [c for c in tg.calls[m:] if c[0] == "sendMessage" and str(c[1].get("chat_id")) == "-100"]
 
     # ---- admin
+    m = tg.mark(); tg.text(U, "/setmax 50"); time.sleep(0.8)                                  # non-admin ignored
+    assert svc.db.max_active(20) == 20
+    m = tg.mark(); tg.text(7, "/setmax 50"); tg.wait_text(7, "max active tasks = 50", since=m)
+    assert svc.max_active() == 50
     m = tg.mark(); tg.text(7, "/stats"); tg.wait_text(7, "minted 3", since=m)
     m = tg.mark(); tg.text(U, "/stats"); time.sleep(0.8)
     assert not [c for c in tg.calls[m:] if c[0] == "sendMessage" and str(c[1].get("chat_id")) == str(U)]

@@ -58,6 +58,9 @@ MINT_KIND = "signed"                # "signed" | "public"
 EXPECTED_PRICE = 0                  # wei per token the user confirmed
 MAX_VALUE_WEI = 0                   # hard cap on msg.value of any tx this engine sends
 QUANTITY = 1                        # tokens per tx (may only be LOWERED at runtime)
+MIN_UNIT = None                     # price policy: accepted unit price range [MIN_UNIT, MAX_UNIT] (wei per token);
+MAX_UNIT = None                     # None -> exact EXPECTED_PRICE (legacy). Set by the wrapper from the user policy.
+TIMING = {}                         # speed report (epoch seconds), filled by main()
 NONCE_FILE = None                   # per-wallet nonce coordination file (service sets it)
 API_MAX_QTY = 100                   # OpenSea /mint accepts quantity 1..100 (docs)
 # Priority fee: set equal to maxFee at runtime. Measured on this chain (355 SeaDrop txs of the Thousand
@@ -143,6 +146,17 @@ def word(data, i):
     return data[10 + 64 * i: 10 + 64 * (i + 1)]
 
 
+def unit_range():
+    lo = EXPECTED_PRICE if MIN_UNIT is None else MIN_UNIT
+    hi = EXPECTED_PRICE if MAX_UNIT is None else MAX_UNIT
+    return lo, hi
+
+
+def unit_ok(unit):
+    lo, hi = unit_range()
+    return lo <= unit <= hi and unit * QUANTITY <= MAX_VALUE_WEI
+
+
 def validate(tx, me):
     """Accept ONLY SeaDrop.<MINT_KIND> for this NFT, qty QUANTITY, to me, value == EXPECTED_PRICE*QUANTITY <= cap.
     Returns (ok, reason, value_wei)."""
@@ -162,8 +176,11 @@ def _validate(tx, me):
         return False, f"bad value {val!r}", None
     if to != SD:
         return False, f"target {to} is not SeaDrop", None
-    if v != EXPECTED_PRICE * QUANTITY:
-        return False, f"value {v} != confirmed price {EXPECTED_PRICE} x {QUANTITY}", None
+    if v % QUANTITY:
+        return False, f"value {v} is not a multiple of quantity {QUANTITY}", None
+    lo, hi = unit_range()
+    if not lo <= v // QUANTITY <= hi:
+        return False, f"unit price {v // QUANTITY} outside policy [{lo}, {hi}] (stage price changed)", None
     if v > MAX_VALUE_WEI:
         return False, f"value {v} > spend cap {MAX_VALUE_WEI}", None
     # NOTE: OpenSea appends a short attribution suffix (measured: 4 bytes) after the ABI body,
@@ -210,8 +227,8 @@ def _validate(tx, me):
         return False, "recipient is not this wallet", None
     if int(word(data, 3), 16) != QUANTITY:
         return False, f"quantity {int(word(data, 3), 16)} != {QUANTITY}", None
-    if int(word(data, 4), 16) != EXPECTED_PRICE:
-        return False, f"signed mintPrice {int(word(data, 4), 16)} != confirmed price {EXPECTED_PRICE}", None
+    if int(word(data, 4), 16) * QUANTITY != v:
+        return False, f"signed mintPrice {int(word(data, 4), 16)} x {QUANTITY} != value {v}", None
     return True, "mintSigned", v
 
 
@@ -346,6 +363,48 @@ def target_held(me):
     """balanceOf fallback used only when no sibling task of this wallet minted meanwhile; receipts are the
     authoritative proof (settle_from_receipts)."""
     return not sibling_active() and nft_balance(me) >= TARGET_HELD
+
+
+SEADROP_MINT_TOPIC = "0x" + keccak(text="SeaDropMint(address,address,address,address,uint256,uint256,uint256,uint256)").hex().removeprefix("0x")
+
+
+def first_block_at_or_after(ts_target, hi_bn, hi_ts, max_back=20000):
+    """Lowest block number in (hi_bn - max_back, hi_bn] whose timestamp >= ts_target (binary search)."""
+    lo = max(0, hi_bn - max_back)
+    if hi_ts < ts_target:
+        return None
+    blk_ts = lambda n: int(rr("eth_getBlockByNumber", [hex(n), False], tries=2)["timestamp"], 16)
+    if blk_ts(lo) >= ts_target:
+        return lo
+    while hi_bn - lo > 1:                     # invariant: ts(lo) < target <= ts(hi_bn)
+        mid = (lo + hi_bn) // 2
+        if blk_ts(mid) >= ts_target:
+            hi_bn = mid
+        else:
+            lo = mid
+    return hi_bn
+
+
+def record_onchain_speed(rc):
+    """Block / timestamp / tx index of our mint and our rank among SeaDrop mint txs of THIS NFT whose block
+    timestamp is >= T0: rank = 1 + such txs ordered strictly before ours (block, txIndex). Best effort only."""
+    try:
+        bn, ti = int(rc["blockNumber"], 16), int(rc["transactionIndex"], 16)
+        bts = int(rr("eth_getBlockByNumber", [hex(bn), False], tries=3)["timestamp"], 16)
+        RESULT.update(block=bn, block_ts=bts, tx_index=ti)
+        t0 = TIMING.get("t0")
+        if not t0:
+            return
+        start_bn = first_block_at_or_after(int(t0) if t0 == int(t0) else int(t0) + 1, bn, bts)
+        if start_bn is None:
+            return
+        logs = rr("eth_getLogs", [{"address": SD, "topics": [SEADROP_MINT_TOPIC, "0x" + NFT[2:].lower().rjust(64, "0")],
+                                    "fromBlock": hex(start_bn), "toBlock": hex(bn)}], tries=2)
+        before = {(int(l["blockNumber"], 16), int(l["transactionIndex"], 16)) for l in logs}
+        RESULT["rank"] = 1 + sum(1 for x in before if x < (bn, ti))
+        RESULT["first_block"] = start_bn
+    except Exception as e:  # noqa: BLE001 — speed report must never break a mint
+        log(f"speed report incomplete: {str(e)[:80]}")
 
 
 def minted_count_onchain(me):
@@ -512,9 +571,11 @@ def main():
     keys = load_api_keys()
     log(f"MINT ENGINE  kind={MINT_KIND} price={EXPECTED_PRICE} cap={MAX_VALUE_WEI}  wallet={me[:6]}...{me[-4:]}  "
         f"mode={'ARMED' if a.arm else 'DRY-RUN'}  api-keys={len(keys)}")
+    lo_, hi_ = unit_range()
     if MINT_KIND not in ("signed", "public") or EXPECTED_PRICE < 0 or not 1 <= QUANTITY <= API_MAX_QTY \
-            or EXPECTED_PRICE * QUANTITY > MAX_VALUE_WEI:
+            or not 0 <= lo_ <= hi_ or hi_ * QUANTITY > MAX_VALUE_WEI:
         raise SystemExit("bad mint policy")
+    log(f"price policy: unit in [{lo_}, {hi_}] wei (listed {EXPECTED_PRICE}), cap {MAX_VALUE_WEI}")
 
     if int(rr("eth_chainId", []), 16) != CHAIN_ID:
         raise SystemExit("wrong chain")
@@ -535,8 +596,10 @@ def main():
         s0, e0, st, d = api_stage_times(keys[0])
         api_limit = int(st["max_per_wallet"]) if str(st.get("max_per_wallet") or "").isdigit() else None
         log(f"API: stage '{STAGE_LABEL}' {st['start_time']} -> {st['end_time']} price={st['price']} max/wallet={st['max_per_wallet']} supply {d.get('total_supply')}/{d.get('max_supply')}")
-        if str(st["price"]) != str(EXPECTED_PRICE):
-            raise SystemExit(f"stage price {st['price']} != confirmed price {EXPECTED_PRICE} — refusing")
+        sp_ = int(st["price"]) if str(st.get("price") or "").isdigit() else None
+        if sp_ is None or not unit_ok(sp_):
+            RESULT["reason"] = "price_changed"
+            raise SystemExit(f"stage price {st['price']} outside policy {unit_range()} — refusing")
         if not a.start and (s0, e0) != (STAGE_START, STAGE_END):
             log(f"!! API times differ from built-in -> following API: {s0} -> {e0}")
             T0, T_END = s0, e0
@@ -567,7 +630,7 @@ def main():
             log(f"getPublicDrop failed ({str(e)[:60]}) — limit unknown, OpenSea/contract will enforce it")
     want = QUANTITY
     q, why = clamp_quantity(want, limit, ms[0] if ms else None, ms[1] if ms else None, ms[2] if ms else None,
-                            bal, EXPECTED_PRICE)
+                            bal, unit_range()[1])                # worst case the policy allows
     log(f"quantity: wanted {want}, minted so far {ms[0] if ms else '?'} / limit {limit or '?'}, "
         f"supply {ms[1] if ms else '?'}/{ms[2] if ms else '?'} -> {q}" + (f" ({why})" if why and q < want else ""))
     if q < 1:
@@ -578,9 +641,10 @@ def main():
     QUANTITY = q
     RESULT["quantity"] = q
     MINTED_BEFORE = ms[0] if ms else None
-    if bal <= EXPECTED_PRICE * QUANTITY:
-        raise SystemExit(f"balance {bal/1e18:.8f} ETH does not cover mint price {EXPECTED_PRICE*QUANTITY/1e18:.8f} ETH")
-    bal -= EXPECTED_PRICE * QUANTITY                     # gas budget = what is left after paying the price
+    worst = unit_range()[1] * QUANTITY
+    if bal <= worst:
+        raise SystemExit(f"balance {bal/1e18:.8f} ETH does not cover mint price {worst/1e18:.8f} ETH")
+    bal -= worst                                         # gas budget = what is left after paying the worst-case price
     n_latest = int(rr("eth_getTransactionCount", [me, "latest"]), 16)
     n_pend = int(rr("eth_getTransactionCount", [me, "pending"]), 16)
     nonce = n_pend
@@ -648,6 +712,7 @@ def main():
                 with lk:
                     if state["tx"] is None:
                         state["tx"] = dict(body, _value=val)
+                        TIMING["api_win"] = time.time()
                         win.set()
                         log(f"{tag} API 200 in {ms:.0f} ms -> calldata valid (WIN)")
                     else:
@@ -656,6 +721,8 @@ def main():
                 log(f"{tag} API 200 but REFUSED: {why}")
                 with lk:
                     state["last_err"] = "REFUSED:" + why
+                    if "outside policy" in why:
+                        RESULT["reason"] = "price_changed"
         else:
             msg = json.dumps(body)[:260]
             with lk:
@@ -676,6 +743,7 @@ def main():
 
     precise_sleep_until(T0)
     log(">>> T0")
+    TIMING["t0"] = T0
     t_fire = time.time()
     for i, (off, kidx) in enumerate(WAVE):
         if win.wait(max(0.0, t_fire + off - time.time())):     # wakes instantly on a win
@@ -729,12 +797,22 @@ def main():
 
     tx = state["tx"]
     VALUE = tx["_value"]
-    if VALUE != EXPECTED_PRICE * QUANTITY or VALUE > MAX_VALUE_WEI:   # re-checked right before any signing
+    if VALUE % QUANTITY or not unit_ok(VALUE // QUANTITY):          # re-checked right before any signing
+        RESULT["reason"] = "price_changed"
         log("value/price policy mismatch — refusing"); return
+    RESULT["unit_price"] = VALUE // QUANTITY
     if tx["data"][:10].lower() == SEL_PUBLIC:
         p_, st_, en_ = onchain_public_price()
-        if p_ != EXPECTED_PRICE:
-            log(f"on-chain public price {p_} != confirmed {EXPECTED_PRICE} — refusing"); return
+        if p_ * QUANTITY != VALUE:
+            # mintPublic calldata carries no price: the contract charges its CURRENT price. Follow it only if the
+            # user's policy accepts it; otherwise nothing is sent (sending the old value would just revert).
+            if unit_ok(p_):
+                log(f"on-chain public price changed {VALUE // QUANTITY} -> {p_} (within policy) — paying {p_} x {QUANTITY}")
+                VALUE = p_ * QUANTITY
+                RESULT["unit_price"] = p_
+            else:
+                RESULT["reason"] = "price_changed"
+                log(f"on-chain public price {p_} outside policy {unit_range()} — refusing"); return
     else:
         st_, en_ = signed_window(tx["data"])
         if not (st_ < T_END and en_ > T0):               # OpenSea picks "the first eligible stage": not ours
@@ -763,6 +841,8 @@ def main():
             r_ = wait_receipt(hh, read_sess, timeout=3)
             if r_ and int(r_["status"], 16) == 1 and minted_token_ids(r_, me):
                 RESULT.update(minted=True, tx=hh, token_ids=minted_token_ids(r_, me), reason=None)
+                TIMING.setdefault("receipt", time.time())
+                record_onchain_speed(r_)
                 log(f"*** MINTED *** ({why}) token ids {RESULT['token_ids']} | tx {hh}")
                 return True
         return False
@@ -786,6 +866,7 @@ def main():
             broadcasts += 1
             if any(accepted(r) for r in res.values()):
                 gate.write(nonce + 1)
+                TIMING.setdefault("sent", time.time())
         log(f"SENT #{broadcasts} nonce {nonce} {h} (T0+{(time.time()-T0)*1000:.0f} ms) | " +
             " | ".join(f"{u.split('//')[1][:14]} {r.get('_ms','?')}ms {'ok' if accepted(r) else str(r.get('error',{}).get('message','?'))[:60]}" for u, r in res.items()))
         if not any(accepted(r) for r in res.values()):
@@ -803,6 +884,8 @@ def main():
         if rc and int(rc["status"], 16) == 1:
             ids = minted_token_ids(rc, me)
             RESULT.update(minted=bool(ids), tx=h, token_ids=ids, reason=None if ids else "no_transfer_in_receipt")
+            TIMING["receipt"] = time.time()
+            record_onchain_speed(rc)
             log(f"*** MINTED *** block {int(rc['blockNumber'],16)} idx {int(rc['transactionIndex'],16)} gasUsed {int(rc['gasUsed'],16)} "
                 f"| token ids {ids} | tx {h}")
             return

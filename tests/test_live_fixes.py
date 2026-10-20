@@ -56,3 +56,20 @@ def test_onchain_helpers(monkeypatch):
         pf.minted_count(nft, "0x" + "a8" * 20)
     assert pf.stage_wallet_limit({"max_per_wallet": "2"}) == 2
     assert pf.stage_wallet_limit({"max_per_wallet": None}) is None and pf.stage_wallet_limit({}) is None
+
+
+def test_unit_bounds_and_speed_text():
+    P = 10 ** 15
+    assert Service.unit_bounds(P, "exact", 0) == (P, P)
+    assert Service.unit_bounds(P, "lower_ok", 0) == (0, P)
+    assert Service.unit_bounds(P, "cap", 10) == (P, P * 11 // 10)
+    assert Service.unit_bounds(P, "any_up", 50) == (0, P * 3 // 2)
+    assert Service.unit_bounds(0, "cap", 50) == (0, 0)            # free stays free
+    from service.runner import speed_text
+    st, msg = classify({"minted": True, "tx": "0xab", "token_ids": [1, 2], "wanted": 2,
+                        "speed": {"api_win": 0.312, "sent": 0.351, "receipt": 0.52, "block": 9, "tx_index": 1,
+                                  "block_delta": 0, "rank": 3, "unit_price": P}})
+    assert st == "minted" and "+0.312" in msg and "+0.351" in msg and "+0.520" in msg and "#3" in msg and "0.001000" in msg
+    assert speed_text({}) == ""
+    st, msg = classify({"minted": False, "reason": "price_changed", "error": ""})
+    assert st == "failed" and "قیمت" in msg

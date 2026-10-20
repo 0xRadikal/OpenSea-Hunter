@@ -28,6 +28,13 @@ from .vault import Vault, VaultError, load_master_key, normalize_private_key
 log = logging.getLogger("bot")
 
 B_SUB, B_WAL, B_KEY, B_NEW, B_TASKS, B_HELP = "💳 اشتراک", "👛 ولت‌ها", "🔑 کلید API", "🎯 تسک جدید", "📋 تسک‌ها", "❓ راهنما"
+B_SET = "⚙️ تنظیمات"
+POLICY_FA = {
+    "exact": "فقط با همان قیمت تأییدشده (هر تغییری ← بیخیال)",
+    "lower_ok": "اگر قیمت کمتر شد مینت کن، اگر بیشتر شد بیخیال",
+    "cap": "تا سقف افزایش مشخص (٪) مینت کن، بیشتر ← بیخیال",
+    "any_up": "با هر قیمتی تا سقف خرج ثابت هر عدد (٪) — ریسک بالا",
+}
 PRIVATE = filters.ChatType.PRIVATE
 
 
@@ -70,13 +77,30 @@ class Service:
             log.warning("notify %s failed: %s", uid, type(e).__name__)
 
     def menu(self):
-        rows = [[B_NEW, B_TASKS], [B_WAL, B_KEY], [B_SUB, B_HELP]]
+        rows = [[B_NEW, B_TASKS], [B_WAL, B_KEY], [B_SET, B_SUB], [B_HELP]]
         if self.cfg.keypage_url:
             rows.insert(2, [KeyboardButton("⚡ ساخت خودکار کلید API", web_app=WebAppInfo(self.cfg.keypage_url))])
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
     async def blocking(self, f, *a):
         return await asyncio.get_running_loop().run_in_executor(None, f, *a)
+
+    @staticmethod
+    def unit_bounds(price, policy, pct):
+        """(min_unit, max_unit) wei per token the engine may pay under the user's price-change policy."""
+        pct = int(pct or 0)
+        hi_pct = price + price * pct // 100
+        return {"exact": (price, price),
+                "lower_ok": (0, price),
+                "cap": (price, hi_pct),
+                "any_up": (0, hi_pct)}[policy]
+
+    def policy_line(self, pref):
+        pol = pref["price_policy"]
+        return POLICY_FA[pol] + (f" — سقف +{pref['max_increase_pct']}٪" if pol in ("cap", "any_up") else "")
+
+    def max_active(self):
+        return self.db.max_active(self.cfg.max_active_tasks)
 
     def user_key(self, uid):
         k = self.db.apikey(uid)
@@ -101,14 +125,17 @@ class Service:
             "• دراپ‌های SeaDrop روی Robinhood Chain: مراحل امضادار (Allowlist) و عمومی (Public)، رایگان یا پولی.\n"
             "• یک لینک ← یک ولت ← چند مرحله با تعداد دلخواه برای هرکدام. ربات allowlist و سقف هر ولت را برای "
             "هر مرحله چک می‌کند (ورود SIWE به OpenSea) و در لحظهٔ شروع هر مرحله شلیک می‌کند.\n"
-            "• سقف هر ولت در SeaDrop تجمعی است؛ ربات هرگز بیشتر از سقف، عرضه یا قیمت تأییدشده ارسال نمی‌کند.\n"
+            "• سقف هر ولت در SeaDrop تجمعی است؛ ربات هرگز بیشتر از سقف، عرضه یا قیمت قابل‌قبول ارسال نمی‌کند.\n"
+            "• ⚙️ تنظیمات: واکنش به تغییر قیمت (فقط همان قیمت / کمتر شد مینت کن / تا سقف ٪ / هر تغییری تا سقف ٪).\n"
+            "• 🔑 چند کلید API: هر مرحلهٔ هم‌زمان کلید اختصاصی خودش را می‌گیرد.\n"
+            "• بعد از هر مینت سرعت (از لحظهٔ شروع تا امضا، ارسال و تأیید) و رتبهٔ شما بین مینت‌کننده‌ها گزارش می‌شود.\n"
             "• هر کاربر با کلید API شخصی خودش کار می‌کند (سهمیه OpenSea بین کاربران تقسیم نمی‌شود).\n"
             "• کلیدهای فوری OpenSea ۷ روزه‌اند؛ قبل از هر دراپ مطمئن شوید کلید معتبر است.\n\n"
             "🔐 امنیت:\n"
             "• حتماً یک ولت جداگانه (burner) فقط با کمی ETH برای گس بسازید و NFT را بعد از مینت منتقل کنید.\n"
             "• کلید خصوصی پس از دریافت فوراً از چت پاک و رمزنگاری‌شده (AES-256-GCM) ذخیره می‌شود.\n"
             "• هیچ‌وقت کلید ولت اصلی خود را وارد نکنید.\n\n"
-            "دستورات: /start /cancel /wallets /key /tasks /sub")
+            "دستورات: /start /cancel /wallets /key /tasks /sub /settings")
 
     async def cancel_cmd(self, u: Update, c):
         c.user_data.clear()
@@ -206,21 +233,41 @@ class Service:
                                             parse_mode=ParseMode.HTML, reply_markup=self.menu())
 
     # ------------------------------------------------------------------ OpenSea API key
+    def key_menu(self, uid):
+        ks = self.db.apikeys(uid)
+        now = time.time()
+        lines = ["🔑 کلیدهای API شخصی OpenSea"]
+        if not ks:
+            lines.append("وضعیت: ثبت نشده")
+        for k in ks:
+            n = self.db.q("SELECT COUNT(*) FROM tasks WHERE apikey_id=? AND status IN ('scheduled','running')", (k["id"],))[0][0]
+            dead = k["expires_at"] and k["expires_at"] < now
+            lines.append(f"{'⛔' if dead else '🟢'} {esc(k['label'] or k['id'])} ({k['source']}) — "
+                         + (f"انقضا: {fmt_ts(k['expires_at'])}" if k["expires_at"] else "انقضا: نامشخص") + f" — تسک فعال: {n}")
+        lines.append("\nℹ️ هر تسک (مرحله) یک کلید اختصاصی می‌گیرد تا سهمیهٔ درخواست مینت OpenSea بین مرحله‌های هم‌زمان "
+                     "تقسیم نشود. اگر کلید کافی نباشد، تسک‌های هم‌زمان کلید مشترک می‌گیرند و ربات قبل از تأیید هشدار می‌دهد.\n"
+                     "⚠️ طبق OpenSea کلیدهای یک حساب سهمیهٔ مشترک دارند و کلید فوری روزانه ۲ عدد برای هر IP است؛ "
+                     "کلیدهای جدا از اینترنت‌های/حساب‌های مختلف بسازید.\n\n"
+                     "روش ۱: دکمه «⚡ ساخت خودکار کلید API» در منو (از اینترنت خود شما).\n"
+                     "روش ۲: <code>curl -X POST https://api.opensea.io/api/v2/auth/keys</code> یا کلید کامل از "
+                     "opensea.io/settings/developer و ارسال همین‌جا.")
+        kb = [[IB("➕ افزودن کلید (دستی)", callback_data="kset")]] + \
+             [[IB(f"🗑 حذف {k['label'] or k['id']}", callback_data=f"kdel:{k['id']}")] for k in ks]
+        return "\n".join(lines), IM(kb)
+
     async def key(self, u: Update, c):
         uid = u.effective_user.id
         self.db.ensure_user(uid, u.effective_user.username)
-        k = self.db.apikey(uid)
-        s = "🔑 کلید API شخصی OpenSea\n"
-        if k:
-            exp = f"انقضا: {fmt_ts(k['expires_at'])}" if k["expires_at"] else "انقضا: نامشخص"
-            s += f"وضعیت: ثبت شده ({k['source']}) — {exp}\n\n"
-        else:
-            s += "وضعیت: ثبت نشده\n\n"
-        s += ("روش ۱ (پیشنهادی): دکمه «⚡ ساخت خودکار کلید API» در منو — کلید از اینترنت خود شما از OpenSea گرفته "
-              "و مستقیم به ربات داده می‌شود.\n"
-              "روش ۲: در مرورگر خود این دستور را اجرا یا کلید کامل را از opensea.io/settings/developer بگیرید و همین‌جا بفرستید:\n"
-              "<code>curl -X POST https://api.opensea.io/api/v2/auth/keys</code>")
-        await u.message.reply_text(s, parse_mode=ParseMode.HTML, reply_markup=IM([[IB("✍️ ارسال دستی کلید", callback_data="kset")]]))
+        txt, kb = self.key_menu(uid)
+        await u.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def key_del(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        kid = int(q.data.split(":")[1])
+        ok = self.db.delete_apikey(q.from_user.id, kid)
+        self.db.audit(q.from_user.id, "apikey_delete", f"{kid} {ok}")
+        await q.message.reply_text("حذف شد." if ok else "این کلید به تسک فعال اختصاص دارد؛ اول تسک را لغو کنید.")
 
     async def key_set(self, u: Update, c):
         q = u.callback_query
@@ -236,11 +283,18 @@ class Service:
             return await u.effective_chat.send_message(f"⚠️ تست کلید ممکن نشد: {e}. بعداً دوباره امتحان کنید.")
         if not ok:
             return await u.effective_chat.send_message(f"❌ کلید توسط OpenSea رد شد: {why}")
-        self.db.set_apikey(uid, self.vault.seal(uid, "apikey", key), expires_at, source)
-        self.db.audit(uid, "apikey_set", source)
+        import hashlib
+        fp = hashlib.sha256(("osh-key|" + key).encode()).hexdigest()[:32]
+        r = self.db.add_apikey(uid, self.vault.seal(uid, "apikey", key), expires_at, source, fp)
         c.user_data.pop("state", None)
+        if r == "dup":
+            return await u.effective_chat.send_message("ℹ️ این کلید قبلاً ثبت شده است.", reply_markup=self.menu())
+        if r == "full":
+            return await u.effective_chat.send_message(f"❌ حداکثر {self.db.MAX_KEYS} کلید مجاز است؛ یکی را حذف کنید.")
+        self.db.audit(uid, "apikey_add", f"{r} {source}")
         exp = f"\nانقضا: {fmt_ts(expires_at)}" if expires_at else ""
-        await u.effective_chat.send_message("✅ کلید API تست و ذخیره شد." + exp, reply_markup=self.menu())
+        n = len(self.db.apikeys(uid, valid_after=time.time()))
+        await u.effective_chat.send_message(f"✅ کلید API تست و ذخیره شد. (کلیدهای معتبر شما: {n})" + exp, reply_markup=self.menu())
 
     @staticmethod
     def parse_key_text(text):
@@ -292,8 +346,8 @@ class Service:
             return await u.message.reply_text("اول کلید API را ثبت کنید (🔑 کلید API).")
         if not self.db.wallets(uid):
             return await u.message.reply_text("اول یک ولت ثبت کنید (👛 ولت‌ها).")
-        if len(self.db.tasks(uid, active_only=True)) >= self.cfg.max_active_tasks:
-            return await u.message.reply_text(f"حداکثر {self.cfg.max_active_tasks} تسک فعال مجاز است.")
+        if self.db.active_count(uid) >= self.max_active():
+            return await u.message.reply_text(f"حداکثر {self.max_active()} تسک فعال مجاز است.")
         c.user_data["state"] = "await_link"
         await u.message.reply_text("🔗 لینک کالکشن OpenSea (یا slug) را بفرستید.\nمثال: https://opensea.io/collection/aerent")
 
@@ -527,7 +581,10 @@ class Service:
         if not p or p.get("step") != "select" or not any(s["qty"] for s in p["stages"]):
             return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
         proj = self.project(p)
-        total = sum(s["price_wei"] * s["qty"] for s, _ in proj)
+        pref = self.db.prefs(uid)
+        for s, _ in proj:
+            s["min_unit"], s["max_unit"] = self.unit_bounds(s["price_wei"], pref["price_policy"], pref["max_increase_pct"])
+        total = sum(s["max_unit"] * s["qty"] for s, _ in proj)
         gas = pf.WARN_BALANCE_WEI * len(proj)
         lines, ok = [f"📋 <b>خلاصهٔ برنامهٔ مینت</b> — {esc(p['name'])}\n👛 <code>{p['addr']}</code>\n"], True
         for n, (s, eff) in enumerate(proj, 1):
@@ -535,26 +592,37 @@ class Service:
             cost = "رایگان" if not pr else f"{pr / 1e18:.6f} × {qt} = {pr * qt / 1e18:.6f} ETH"
             lines.append(f"{n}) <b>{esc(s['label'])}</b> ({self.kind_fa(s['kind'])}) — {fmt_ts(s['start'])}\n"
                          f"   تعداد: <b>{qt}</b> — {cost}")
+            if s["max_unit"] != pr or s["min_unit"] != pr:
+                lines.append(f"   قیمت قابل‌قبول هر عدد: {s['min_unit'] / 1e18:.6f} تا {s['max_unit'] / 1e18:.6f} ETH")
             if eff < s["qty"]:
                 lines.append(f"   ⚠️ اگر مراحل قبلی کامل مینت شوند، به‌خاطر سقف تجمعی ({s['limit']}) در این مرحله فقط "
                              f"{eff} عدد ممکن است. ربات لحظهٔ شلیک دوباره از روی زنجیره حساب می‌کند و هرگز بیشتر از سقف نمی‌فرستد.")
         lines.append(f"\n💰 جمع قیمت (حداکثر): {total / 1e18:.6f} ETH + گس (~{gas / 1e18:.4f}) | موجودی: {p['bal'] / 1e18:.6f} ETH")
         if p["bal"] < total + gas:
             lines.append("⚠️ موجودی برای همهٔ برنامه کافی نیست؛ ربات در هر مرحله فقط به اندازهٔ موجودی همان لحظه مینت می‌کند.")
-        k = self.db.apikey(uid)
         last = max(s["start"] for s, _ in proj)
-        if k["expires_at"] and k["expires_at"] < max(last, time.time()) + 300:
+        lines.append(f"\n💲 اگر قیمت عوض شد: {self.policy_line(pref)}  (تغییر در «⚙️ تنظیمات»)")
+        assign = self.db.pick_keys(uid, [{"start": s["start"], "end": s["end"]} for s, _ in proj])
+        if any(kid is None for kid, _ in assign):
             ok = False
-            lines.append(f"❌ کلید API قبل از شروع آخرین مرحله منقضی می‌شود ({fmt_ts(k['expires_at'])}); کلید جدید بگیرید.")
+            lines.append("❌ برای بعضی مرحله‌ها هیچ کلید API معتبری تا زمان شروع ندارید؛ کلید جدید ثبت کنید.")
+        else:
+            labels = {k["id"]: k["label"] or str(k["id"]) for k in self.db.apikeys(uid)}
+            shared = sum(1 for _, sh in assign if sh)
+            lines.append("🔑 کلید هر مرحله: " + "، ".join(f"{s['label'][:16]} ← {labels.get(kid, kid)}"
+                                                       for (s, _), (kid, _) in zip(proj, assign)))
+            if shared:
+                lines.append(f"⚠️ {shared} مرحله با مرحلهٔ هم‌زمان دیگری کلید مشترک دارد (سهمیهٔ ۵ درخواست مینت OpenSea "
+                             "تقسیم می‌شود). برای کلید اختصاصی کلید بیشتری اضافه کنید.")
         usr = self.db.user(uid)
         if usr and usr["sub_until"] < last:
             ok = False
             lines.append(f"❌ اشتراک شما قبل از شروع آخرین مرحله تمام می‌شود ({fmt_ts(usr['sub_until'])}); اول تمدید کنید.")
-        if len(self.db.tasks(uid, active_only=True)) + len(proj) > self.cfg.max_active_tasks:
+        if self.db.active_count(uid) + len(proj) > self.max_active():
             ok = False
-            lines.append(f"❌ با این برنامه از سقف {self.cfg.max_active_tasks} تسک فعال رد می‌شوید.")
-        lines.append("\n🔒 ربات در هر مرحله دقیقاً قیمت اعلام‌شده × تعداد را می‌پردازد، نه بیشتر؛ اگر سازنده قیمت را بالا ببرد "
-                     "چیزی ارسال نمی‌شود. تعداد هم فقط ممکن است کمتر شود (سقف ولت / عرضه / موجودی)، هرگز بیشتر.")
+            lines.append(f"❌ با این برنامه از سقف {self.max_active()} تسک فعال رد می‌شوید.")
+        lines.append("\n🔒 ربات هرگز بیشتر از «قیمت قابل‌قبول × تعداد» نمی‌پردازد و همیشه همان مبلغی را می‌فرستد که قرارداد "
+                     "می‌خواهد. تعداد فقط ممکن است کمتر شود (سقف ولت / عرضه / موجودی)، هرگز بیشتر.")
         p["step"] = "summary"
         kb = ([[IB("🚀 تأیید و مسلح کردن", callback_data="pa")]] if ok else []) + \
              [[IB("✏️ ویرایش", callback_data="pb"), IB("✖️ انصراف", callback_data="px")]]
@@ -572,10 +640,15 @@ class Service:
             return await q.message.reply_text(m)
         p["step"] = "arming"                                     # double taps hit the guard above
         sel = sorted((s for s in p["stages"] if s["qty"]), key=lambda s: s["start"])
-        items = [{"label": s["label"], "start": s["start"], "end": s["end"], "kind": s["kind"],
-                  "price_wei": s["price_wei"], "quantity": s["qty"]} for s in sel]
+        pref = self.db.prefs(uid)
+        items = []
+        for s in sel:
+            lo, hi = self.unit_bounds(s["price_wei"], pref["price_policy"], pref["max_increase_pct"])
+            items.append({"label": s["label"], "start": s["start"], "end": s["end"], "kind": s["kind"],
+                          "price_wei": s["price_wei"], "quantity": s["qty"], "policy": pref["price_policy"],
+                          "min_unit": lo, "max_unit": hi})
         plan_id = os.urandom(6).hex()
-        res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.cfg.max_active_tasks, plan_id)
+        res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.max_active(), plan_id)
         if res in ("dup", "limit"):
             p["step"] = "summary"
             return await q.message.reply_text("برای یکی از این مرحله‌ها با این ولت قبلاً تسک فعال دارید." if res == "dup"
@@ -601,6 +674,65 @@ class Service:
         await q.answer()
         await q.message.reply_text("این دکمه مربوط به نسخهٔ قبلی است؛ دوباره «🎯 تسک جدید» را بزنید.")
 
+    # ------------------------------------------------------------------ settings
+    def settings_view(self, uid):
+        pref = self.db.prefs(uid)
+        txt = ("⚙️ <b>تنظیمات</b>\n\n💲 <b>واکنش به تغییر قیمت</b> (اگر سازنده هنگام شروع/حین مینت قیمت را عوض کند):\n"
+               f"فعلی: <b>{esc(self.policy_line(pref))}</b>\n\n"
+               "• <b>فقط همان قیمت</b>: هر تغییری ← هیچ تراکنشی ارسال نمی‌شود (امن‌ترین).\n"
+               "• <b>کمتر شد مینت کن</b>: ارزان‌تر شد ← مینت، گران‌تر شد ← بیخیال.\n"
+               "• <b>تا سقف ٪</b>: تا درصدی که تعیین می‌کنید گران‌تر هم مینت می‌کند؛ ارزان‌تر شدن ← بیخیال.\n"
+               "• <b>هر تغییری تا سقف ٪</b>: ارزان‌تر یا گران‌تر (تا سقف) ← مینت.\n\n"
+               "ربات همیشه دقیقاً همان مبلغی را می‌فرستد که قرارداد می‌خواهد و هرگز بیشتر از سقف. "
+               "تنظیم روی برنامه‌هایی اعمال می‌شود که از این به بعد مسلح می‌کنید.\n\n"
+               f"📊 سقف تسک فعال: {self.max_active()}")
+        cur = pref["price_policy"]
+        mk = lambda key, label: IB(("✅ " if cur == key else "") + label, callback_data=f"cp:{key}")
+        kb = [[mk("exact", "فقط همان قیمت")], [mk("lower_ok", "کمتر شد مینت کن")],
+              [mk("cap", "تا سقف ٪ گران‌تر")], [mk("any_up", "هر تغییری تا سقف ٪")]]
+        if cur in ("cap", "any_up"):
+            kb.append([IB(("✅ " if pref["max_increase_pct"] == n else "") + f"+{n}٪", callback_data=f"cpp:{n}")
+                       for n in (5, 10, 25, 50, 100)])
+        return txt, IM(kb)
+
+    async def settings(self, u: Update, c):
+        uid = u.effective_user.id
+        self.db.ensure_user(uid, u.effective_user.username)
+        txt, kb = self.settings_view(uid)
+        await u.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def set_policy(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        uid = q.from_user.id
+        pref = self.db.prefs(uid)
+        if q.data.startswith("cpp:"):
+            pct = int(q.data.split(":")[1])
+            if pct not in (5, 10, 25, 50, 100) or pref["price_policy"] not in ("cap", "any_up"):
+                return
+            self.db.set_prefs(uid, pref["price_policy"], pct)
+        else:
+            pol = q.data.split(":")[1]
+            if pol not in POLICY_FA:
+                return
+            pct = pref["max_increase_pct"] or (10 if pol in ("cap", "any_up") else 0)
+            self.db.set_prefs(uid, pol, pct if pol in ("cap", "any_up") else 0)
+        self.db.audit(uid, "price_policy", json.dumps(self.db.prefs(uid)))
+        txt, kb = self.settings_view(uid)
+        await q.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def setmax(self, u: Update, c):
+        if not self.is_admin(u):
+            return
+        try:
+            n = int(c.args[0])
+            assert 1 <= n <= 500
+        except (IndexError, ValueError, AssertionError):
+            return await u.message.reply_text(f"/setmax <1..500>  (فعلی: {self.max_active()})")
+        self.db.set_setting("max_active_tasks", n)
+        self.db.audit(u.effective_user.id, "admin_setmax", str(n))
+        await u.message.reply_text(f"ok, max active tasks = {n}")
+
     async def tasks(self, u: Update, c):
         uid = u.effective_user.id
         ts = self.db.tasks(uid)
@@ -624,7 +756,8 @@ class Service:
     # ------------------------------------------------------------------ text router
     async def text(self, u: Update, c):
         t = u.message.text
-        routes = {B_SUB: self.sub, B_WAL: self.wallets, B_KEY: self.key, B_NEW: self.new_task, B_TASKS: self.tasks, B_HELP: self.help}
+        routes = {B_SUB: self.sub, B_WAL: self.wallets, B_KEY: self.key, B_NEW: self.new_task, B_TASKS: self.tasks,
+                  B_HELP: self.help, B_SET: self.settings}
         st = c.user_data.get("state")
         if st == "await_pk":                    # checked FIRST: a key message must never be echoed/routed
             return await self.got_pk(u, c)
@@ -712,10 +845,14 @@ class Service:
         app.add_handler(CommandHandler("grant", self.grant, filters=P))
         app.add_handler(CommandHandler("ban", self.ban, filters=P))
         app.add_handler(CommandHandler("stats", self.stats, filters=P))
+        app.add_handler(CommandHandler("setmax", self.setmax, filters=P))
+        app.add_handler(CommandHandler("settings", self.settings, filters=P))
         app.add_handler(CallbackQueryHandler(self.buy, pattern=r"^buy$"))
         app.add_handler(CallbackQueryHandler(self.wallet_add, pattern=r"^wadd$"))
         app.add_handler(CallbackQueryHandler(self.wallet_del, pattern=r"^wdel:\d+$"))
         app.add_handler(CallbackQueryHandler(self.key_set, pattern=r"^kset$"))
+        app.add_handler(CallbackQueryHandler(self.key_del, pattern=r"^kdel:\d+$"))
+        app.add_handler(CallbackQueryHandler(self.set_policy, pattern=r"^cpp?:[a-z_0-9]+$"))
         app.add_handler(CallbackQueryHandler(self.plan_wallet, pattern=r"^pw:\d+$"))
         app.add_handler(CallbackQueryHandler(self.plan_stage, pattern=r"^ps:\d+$"))
         app.add_handler(CallbackQueryHandler(self.plan_qty, pattern=r"^pq:\d+:(\d+|max|c)$"))

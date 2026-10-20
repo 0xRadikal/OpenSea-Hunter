@@ -62,6 +62,7 @@ REASONS = {
     "no_transfer_in_receipt": "تراکنش ثبت شد ولی NFTی به این ولت منتقل نشد",
     "sold_out": "ظرفیت کالکشن تمام شده است",
     "insufficient_funds": "موجودی ولت برای قیمت مینت کافی نیست",
+    "price_changed": "قیمت مرحله تغییر کرد و طبق تنظیم قیمت شما مینت انجام نشد (چیزی ارسال نشد)",
 }
 HINTS = (
     ("does not cover mint price", "موجودی ولت برای قیمت مینت کافی نیست"),
@@ -79,6 +80,28 @@ HINTS = (
 )
 
 
+def speed_text(sp):
+    """Human speed report. Times are measured from the stage start (T0) on our NTP-synced clock; block_delta is
+    chain time (1 s resolution on Robinhood Chain); rank counts SeaDrop mint txs of this NFT since T0."""
+    if not sp:
+        return ""
+    out = ["\n⚡ سرعت (از لحظهٔ شروع مرحله):"]
+    if "api_win" in sp:
+        out.append(f"  • امضا/calldata از OpenSea: {sp['api_win']:+.3f} ث")
+    if "sent" in sp:
+        out.append(f"  • ارسال تراکنش (پذیرش sequencer): {sp['sent']:+.3f} ث")
+    if "receipt" in sp:
+        out.append(f"  • تأیید روی زنجیره (رسید): {sp['receipt']:+.3f} ث")
+    if "block" in sp:
+        out.append(f"  • بلاک {sp['block']} (ردیف {sp.get('tx_index', '?')})"
+                   + (f"، زمان بلاک {sp['block_delta']:+d} ث نسبت به شروع" if "block_delta" in sp else ""))
+    if "rank" in sp:
+        out.append(f"  • 🏁 رتبهٔ ما بین مینت‌های این کالکشن از لحظهٔ شروع: #{sp['rank']}")
+    if "unit_price" in sp:
+        out.append(f"  • قیمت پرداختی هر عدد: {sp['unit_price'] / 1e18:.6f} ETH")
+    return "\n".join(out)
+
+
 def classify(res, log_tail=""):
     """-> (status, user message). Raw Python errors are never shown to the user."""
     if not res:
@@ -90,6 +113,7 @@ def classify(res, log_tail=""):
         if ids:
             shown = ids if len(ids) <= 12 else ids[:12]
             m += "\nتوکن: #" + ", #".join(map(str, shown)) + (" …" if len(ids) > 12 else "")
+        m += speed_text(res.get("speed") or {})
         return "minted", m + (f"\ntx: {res['tx']}" if res.get("tx") else "")
     reason = res.get("reason")
     if reason in REASONS:
@@ -113,6 +137,16 @@ class Runner:
     def log_path(self, tid):
         return os.path.join(self.cfg.log_dir, f"task-{tid}.log")
 
+    def task_key(self, t):
+        """The task's own key if still valid through the stage start; else the least-loaded other valid key."""
+        uid = t["user_id"]
+        k = self.db.apikey_by_id(uid, t["apikey_id"]) if t["apikey_id"] else None
+        if k and (not k["expires_at"] or k["expires_at"] > max(time.time(), t["start_ts"]) + 300):
+            return k
+        it = {"start": t["start_ts"], "end": t["end_ts"]}
+        kid, _ = self.db.pick_keys(uid, [it])[0]
+        return self.db.apikey_by_id(uid, kid) if kid else None
+
     def nonce_path(self, wid):
         """One lock file per wallet: sibling tasks (other stages of the same wallet) coordinate nonces through it."""
         return os.path.join(self.cfg.log_dir, f"wallet-{int(wid)}.nonce")
@@ -121,18 +155,26 @@ class Runner:
     def spawn(self, t):
         uid, tid = t["user_id"], t["id"]
         w = self.db.wallet(uid, t["wallet_id"])
-        k = self.db.apikey(uid)
+        k = self.task_key(t)
         if not w or not k:
             return self._finish(t, "failed", "ولت یا کلید API حذف شده است")
         try:
             pk = self.vault.decrypt(uid, w["address"], w["blob"])
             api_key = self.vault.open(uid, "apikey", k["blob"])
+            if k["id"] != t["apikey_id"]:
+                self.db.update_task(tid, apikey_id=k["id"])
+                log.info("task %s: key %s -> %s (assigned key gone/expiring)", tid, t["apikey_id"], k["id"])
         except Exception as e:  # noqa: BLE001
             return self._finish(t, "failed", f"خطای رمزگشایی: {e}")
         cmd = [sys.executable, WRAPPER, "--task-id", str(tid), "--slug", t["slug"], "--nft", t["nft"],
                "--label", t["stage_label"], "--start", str(t["start_ts"]), "--end", str(t["end_ts"]),
                "--kind", t["kind"], "--price-wei", str(t["price_wei"]), "--max-value-wei", str(t["max_value_wei"]),
-               "--quantity", str(t["quantity"]), "--nonce-file", self.nonce_path(t["wallet_id"])] + self.extra_args
+               "--quantity", str(t["quantity"]), "--nonce-file", self.nonce_path(t["wallet_id"])]
+        if t["min_unit_wei"] is not None:
+            cmd += ["--min-unit-wei", str(t["min_unit_wei"])]
+        if t["max_unit_wei"] is not None:
+            cmd += ["--max-unit-wei", str(t["max_unit_wei"])]
+        cmd += self.extra_args
         fd = os.open(self.log_path(tid), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fd, stderr=subprocess.STDOUT,
@@ -165,7 +207,7 @@ class Runner:
 
     def _finish(self, t, status, detail):
         res = parse_result(self.log_path(t["id"])) or {}
-        self.db.update_task(t["id"], status=status, result=detail[:400], tx_hash=res.get("tx"))
+        self.db.update_task(t["id"], status=status, result=detail[:900], tx_hash=res.get("tx"))
         self.procs.pop(t["id"], None)
         icon = {"minted": "✅", "failed": "❌", "ended": "⌛", "cancelled": "🚫", "not_eligible": "⛔"}.get(status, "ℹ️")
         self.notify(t["user_id"], f"{icon} تسک #{t['id']} ({t['slug']} / {t['stage_label']}): {detail}")
@@ -190,9 +232,8 @@ class Runner:
                     if not self.db.is_subscribed(t["user_id"], now):
                         self._finish(t, "failed", "اشتراک منقضی شده است؛ تمدید کنید و تسک را دوباره بسازید")
                         continue
-                    k = self.db.apikey(t["user_id"])
-                    if k and k["expires_at"] and k["expires_at"] < max(now, t["start_ts"]) + 300:
-                        self._finish(t, "failed", "کلید API شما تا زمان شروع مرحله منقضی می‌شود؛ کلید جدید ثبت کنید")
+                    if not self.task_key(t):
+                        self._finish(t, "failed", "هیچ کلید API معتبری تا زمان شروع مرحله ندارید؛ کلید جدید ثبت کنید")
                         continue
                     self.spawn(t)
             elif t["status"] == "running":
@@ -204,8 +245,7 @@ class Runner:
                 self._finish(t, st, detail)
 
     def _pre_warn(self, t):
-        k = self.db.apikey(t["user_id"])
-        if k and k["expires_at"] and k["expires_at"] < t["start_ts"] + 300:
+        if not self.task_key(t):
             self.notify(t["user_id"], f"⚠️ کلید API شما قبل از پایان مرحلهٔ تسک #{t['id']} منقضی می‌شود. "
                                       "لطفاً از منوی «🔑 کلید API» کلید جدید ثبت کنید.")
 

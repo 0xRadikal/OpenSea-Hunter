@@ -135,3 +135,38 @@ def test_nonce_gate(tmp_path):
     with m.NonceGate(None) as g:                                     # no file -> no-op
         assert g.peer_next is None
         g.write(1)
+
+
+@pytest.mark.parametrize("lo,hi,value,ok", [
+    (P, P, P, True), (P, P, P + 1, False), (P, P, P - 1, False),               # exact (legacy default)
+    (0, P, P // 2, True), (0, P, 0, True), (0, P, P + 1, False),               # lower_ok
+    (P, P * 11 // 10, P * 11 // 10, True), (P, P * 11 // 10, P * 11 // 10 + 1, False), (P, P * 11 // 10, P - 1, False),  # cap +10%
+    (0, 2 * P, 2 * P, True), (0, 2 * P, 2 * P + 1, False),                     # any_up +100%
+])
+@pytest.mark.parametrize("q", [1, 3])
+def test_price_policy_public(lo, hi, value, ok, q):
+    m = eng(NFT=NFT_A, MINT_KIND="public", EXPECTED_PRICE=P, MIN_UNIT=lo, MAX_UNIT=hi, MAX_VALUE_WEI=hi * q, QUANTITY=q)
+    r = m.validate({"to": m.SD, "data": public_cd(m, q=q), "value": str(value * q)}, ME)
+    assert r[0] is ok, r
+
+
+@pytest.mark.parametrize("lo,hi,signed_price,value,ok", [
+    (P, P, P, P, True), (P, 2 * P, 2 * P, 2 * P, True),
+    (P, 2 * P, 2 * P, P, False),            # value != signed mintPrice x qty (contract would revert)
+    (P, 2 * P, 3 * P, 3 * P, False),        # above policy
+    (0, P, P // 4, P // 4, True),           # cheaper, lower_ok
+])
+def test_price_policy_signed(lo, hi, signed_price, value, ok):
+    m = eng(NFT=NFT_A, MINT_KIND="signed", EXPECTED_PRICE=P, MIN_UNIT=lo, MAX_UNIT=hi, MAX_VALUE_WEI=hi, QUANTITY=1)
+    assert m.validate({"to": m.SD, "data": signed_cd(m, price=signed_price), "value": str(value)}, ME)[0] is ok
+
+
+def test_policy_never_exceeds_cap():
+    m = eng(NFT=NFT_A, MINT_KIND="public", EXPECTED_PRICE=P, MIN_UNIT=0, MAX_UNIT=10 * P, MAX_VALUE_WEI=2 * P, QUANTITY=1)
+    assert m.validate({"to": m.SD, "data": public_cd(m), "value": str(3 * P)}, ME)[0] is False
+    assert m.unit_ok(2 * P) and not m.unit_ok(2 * P + 1)
+
+
+def test_value_not_multiple_of_qty_refused():
+    m = eng(NFT=NFT_A, MINT_KIND="public", EXPECTED_PRICE=P, MIN_UNIT=0, MAX_UNIT=2 * P, MAX_VALUE_WEI=6 * P, QUANTITY=3)
+    assert m.validate({"to": m.SD, "data": public_cd(m, q=3), "value": str(3 * P + 1)}, ME)[0] is False

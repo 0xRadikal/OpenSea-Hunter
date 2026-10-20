@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--price-wei", type=int, required=True)      # price the user confirmed
     ap.add_argument("--max-value-wei", type=int, required=True)  # hard spend cap (whole tx)
     ap.add_argument("--quantity", type=int, default=1)           # tokens wanted in this stage (may only shrink)
+    ap.add_argument("--min-unit-wei", type=int)                  # price policy: accepted unit price range
+    ap.add_argument("--max-unit-wei", type=int)                  # (default = exactly --price-wei)
     ap.add_argument("--nonce-file")                              # per-wallet nonce lock shared by sibling tasks
     ap.add_argument("--dry-run", action="store_true")
     # testing only (fork + fake OpenSea); never used by the service in production
@@ -62,6 +64,7 @@ def main():
     bot.STAGE_LABEL, bot.STAGE_START, bot.STAGE_END = a.label, a.start, a.end
     bot.MINT_KIND, bot.EXPECTED_PRICE, bot.MAX_VALUE_WEI = a.kind, a.price_wei, a.max_value_wei
     bot.QUANTITY, bot.NONCE_FILE = a.quantity, a.nonce_file
+    bot.MIN_UNIT, bot.MAX_UNIT = a.min_unit_wei, a.max_unit_wei
     if a.api_base:
         bot.API_BASE = a.api_base.rstrip("/") + "/api/v2/drops"
     if a.rpc:
@@ -72,7 +75,7 @@ def main():
 
     def emit(**kw):
         out = {"minted": False, "tx": None, "token_ids": [], "reason": None, "error": "", "holds": -1,
-               "wanted": a.quantity, "quantity": None}
+               "wanted": a.quantity, "quantity": None, "speed": {}}
         out.update(kw)
         print("OSH_RESULT " + json.dumps(out), flush=True)
 
@@ -98,7 +101,17 @@ def main():
     r = dict(bot.RESULT)
     if not r["minted"] and not r["reason"]:
         r["reason"] = "error" if err else "not_minted"
+    t = dict(bot.TIMING)
+    sp = {k: round(t[k] - t["t0"], 3) for k in ("api_win", "sent", "receipt") if t.get("t0") and t.get(k)}
+    for k in ("block", "block_ts", "tx_index", "rank"):
+        if r.get(k) is not None:
+            sp[k] = r[k]
+    if t.get("t0") and r.get("block_ts") is not None:
+        sp["block_delta"] = r["block_ts"] - int(t["t0"])           # chain time of our block - stage start (1 s res.)
+    if r.get("unit_price") is not None:
+        sp["unit_price"] = r["unit_price"]
     emit(minted=r["minted"], tx=r["tx"], token_ids=r["token_ids"], reason=r["reason"], error=err, quantity=r.get("quantity"),
+         speed=sp,
          holds=bot.nft_balance(me))
     return 0
 

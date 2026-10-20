@@ -72,7 +72,7 @@ class FakeOpenSea:
                     f = outer.mint.get(p[3])
                     if not f:
                         return self._send(404, {"errors": ["not found"]})
-                    outer.mint_bodies.append(body)
+                    outer.mint_bodies.append(dict(body, _key=self.headers.get("X-API-KEY"), _slug=p[3]))
                     import inspect
                     nargs = len(inspect.signature(f).parameters)
                     code, b = f(body.get("minter"), body.get("quantity")) if nargs >= 2 else f(body.get("minter"))

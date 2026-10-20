@@ -92,3 +92,68 @@ def test_migration_adds_quantity(tmp_path):
     db = DB(p)
     r = db.task(1)
     assert r["quantity"] == 1 and r["kind"] == "signed" and r["plan_id"] is None
+
+
+def test_key_pool_assignment(tmp_path):
+    from service.db import DB
+    db = DB(str(tmp_path / "k.db")); db.ensure_user(1); wid = db.add_wallet(1, "0x" + "a" * 40, b"x")
+    now = 10_000
+    k1 = db.add_apikey(1, b"b1", now + 7 * 86400, "t", "f1")
+    k2 = db.add_apikey(1, b"b2", now + 7 * 86400, "t", "f2")
+    assert db.add_apikey(1, b"b1", now, "t", "f1") == "dup"
+    it = lambda s, e: {"start": s, "end": e}
+    # two overlapping stages -> two different keys
+    a = db.pick_keys(1, [it(now + 100, now + 900), it(now + 200, now + 900)])
+    assert {a[0][0], a[1][0]} == {k1, k2} and not a[0][1] and not a[1][1]
+    # third overlapping stage -> shared (flagged)
+    a = db.pick_keys(1, [it(now + 100, now + 900)] * 3)
+    assert a[2][1] is True and a[2][0] in (k1, k2)
+    # non-overlapping stages may reuse a key without being flagged
+    a = db.pick_keys(1, [it(now + 100, now + 200), it(now + 5000, now + 6000)])
+    assert not a[0][1] and not a[1][1]
+    # key that expires before the stage is never picked
+    k3 = db.add_apikey(1, b"b3", now + 50, "t", "f3")
+    for kid, _ in db.pick_keys(1, [it(now + 100, now + 900)] * 3):
+        assert kid != k3
+    # active tasks in the DB count as load
+    ids = db.add_plan(1, wid, "s", "0x" + "b" * 40,
+                      [{"label": "A", "start": now + 100, "end": now + 900, "kind": "signed", "price_wei": 0, "quantity": 1},
+                       {"label": "B", "start": now + 100, "end": now + 900, "kind": "public", "price_wei": 0, "quantity": 1}], 20, "p")
+    assert {db.task(i)["apikey_id"] for i in ids} == {k1, k2}
+    assert db.delete_apikey(1, k1) is False                       # used by an active task
+    assert db.delete_apikey(1, k3) is True
+
+
+def test_legacy_key_migrated(tmp_path):
+    import sqlite3
+    from service.db import DB
+    p = str(tmp_path / "l.db")
+    DB(p)                                                         # create schema
+    c = sqlite3.connect(p)
+    c.execute("INSERT INTO users(id,created) VALUES(5,1)")
+    c.execute("INSERT INTO apikeys(user_id,blob,expires_at,source,created) VALUES(5,?,?,?,1)", (b"legacy", 99, "manual"))
+    c.commit(); c.close()
+    db = DB(p); db2 = DB(p)                                       # migration is idempotent
+    ks = db2.apikeys(5)
+    assert len(ks) == 1 and bytes(ks[0]["blob"]) == b"legacy" and ks[0]["expires_at"] == 99
+    assert db.apikey(5)["id"] == ks[0]["id"]
+
+
+def test_prefs_settings_and_policy_columns(tmp_path):
+    import pytest
+    from service.db import DB
+    db = DB(str(tmp_path / "s.db")); db.ensure_user(1); wid = db.add_wallet(1, "0x" + "a" * 40, b"x")
+    assert db.prefs(1)["price_policy"] == "exact"
+    db.set_prefs(1, "cap", 25); assert db.prefs(1) == {"user_id": 1, "price_policy": "cap", "max_increase_pct": 25}
+    with pytest.raises(ValueError):
+        db.set_prefs(1, "yolo", 1)
+    assert db.max_active(20) == 20
+    db.set_setting("max_active_tasks", 77); assert db.max_active(20) == 77
+    P = 10 ** 15
+    ids = db.add_plan(1, wid, "s", "0x" + "b" * 40, [{"label": "A", "start": 1, "end": 2, "kind": "public", "price_wei": P,
+                                                     "quantity": 3, "policy": "cap", "min_unit": P, "max_unit": P * 5 // 4}], 20, "p")
+    t = db.task(ids[0])
+    assert (t["min_unit_wei"], t["max_unit_wei"], t["max_value_wei"], t["price_policy"]) == (str(P), str(P * 5 // 4), str(3 * P * 5 // 4), "cap")
+    for i in range(30):
+        db.add_task(1, wid, "s", "0x" + "c" * 40, f"L{i}", 1, 2)
+    assert db.active_count(1) == 31                               # not capped at 20 like tasks()

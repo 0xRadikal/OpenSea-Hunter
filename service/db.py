@@ -20,7 +20,16 @@ CREATE TABLE IF NOT EXISTS tasks(
   status TEXT NOT NULL, pid INTEGER, log_offset INTEGER NOT NULL DEFAULT 0,
   tx_hash TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
   kind TEXT NOT NULL DEFAULT 'signed', price_wei TEXT NOT NULL DEFAULT '0', max_value_wei TEXT NOT NULL DEFAULT '0',
-  quantity INTEGER NOT NULL DEFAULT 1, plan_id TEXT);
+  quantity INTEGER NOT NULL DEFAULT 1, plan_id TEXT, apikey_id INTEGER,
+  min_unit_wei TEXT, max_unit_wei TEXT, price_policy TEXT NOT NULL DEFAULT 'exact');
+CREATE TABLE IF NOT EXISTS apikeys2(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), blob BLOB NOT NULL,
+  expires_at INTEGER, source TEXT NOT NULL, created INTEGER NOT NULL, label TEXT, fp TEXT NOT NULL,
+  UNIQUE(user_id, fp));
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS user_prefs(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id), price_policy TEXT NOT NULL DEFAULT 'exact',
+  max_increase_pct INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS payments(
   charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, stars INTEGER NOT NULL,
   payload TEXT NOT NULL, created INTEGER NOT NULL, refunded INTEGER NOT NULL DEFAULT 0);
@@ -42,9 +51,22 @@ class DB:
         cols = {r[1] for r in self.c.execute("PRAGMA table_info(tasks)")}
         for col, ddl in (("kind", "TEXT NOT NULL DEFAULT 'signed'"), ("price_wei", "TEXT NOT NULL DEFAULT '0'"),
                          ("max_value_wei", "TEXT NOT NULL DEFAULT '0'"), ("quantity", "INTEGER NOT NULL DEFAULT 1"),
-                         ("plan_id", "TEXT")):
+                         ("plan_id", "TEXT"), ("apikey_id", "INTEGER"), ("min_unit_wei", "TEXT"),
+                         ("max_unit_wei", "TEXT"), ("price_policy", "TEXT NOT NULL DEFAULT 'exact'")):
             if col not in cols:                     # migrate DBs created before paid/public support
                 self.c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+
+        self._migrate_apikeys()
+
+    def _migrate_apikeys(self):
+        """Copy legacy single-key rows (apikeys) into the key pool once; legacy table is kept untouched."""
+        import hashlib
+        with self.lock:
+            for r in self.c.execute("SELECT * FROM apikeys").fetchall():
+                fp = "legacy:" + hashlib.sha256(bytes(r["blob"])).hexdigest()[:16]
+                self.c.execute("INSERT OR IGNORE INTO apikeys2(user_id,blob,expires_at,source,created,label,fp) "
+                               "VALUES(?,?,?,?,?,?,?)", (r["user_id"], r["blob"], r["expires_at"], r["source"], r["created"],
+                                                          "کلید ۱", fp))
 
     def q(self, sql, args=()):
         with self.lock:
@@ -106,6 +128,10 @@ class DB:
         r = self.q("SELECT * FROM wallets WHERE user_id=? AND id=?", (uid, wid))
         return r[0] if r else None
 
+    def max_active(self, default):
+        v = self.setting("max_active_tasks")
+        return int(v) if v and v.isdigit() else default
+
     def delete_wallet(self, uid, wid):
         with self.lock:
             if self.q("SELECT 1 FROM tasks WHERE wallet_id=? AND status IN ('scheduled','running')", (wid,)):
@@ -114,31 +140,113 @@ class DB:
             self.x("DELETE FROM wallets WHERE id=? AND user_id=?", (wid, uid))
             return True
 
-    # api keys
-    def set_apikey(self, uid, blob, expires_at, source):
-        self.x("INSERT INTO apikeys(user_id,blob,expires_at,source,created,last_ok) VALUES(?,?,?,?,?,?) "
-               "ON CONFLICT(user_id) DO UPDATE SET blob=excluded.blob,expires_at=excluded.expires_at,"
-               "source=excluded.source,created=excluded.created,last_ok=excluded.last_ok",
-               (uid, blob, expires_at, source, int(time.time()), int(time.time())))
+    # api keys (pool: each task gets its own key when the user has enough)
+    MAX_KEYS = 50
+
+    def add_apikey(self, uid, blob, expires_at, source, fp):
+        """fp = sha256 fingerprint of the plaintext key (dedupe). Returns key id, "dup" or "full"."""
+        with self.lock:
+            if self.q("SELECT 1 FROM apikeys2 WHERE user_id=? AND fp=?", (uid, fp)):
+                return "dup"
+            if len(self.apikeys(uid)) >= self.MAX_KEYS:
+                return "full"
+            n = self.q("SELECT COUNT(*) FROM apikeys2 WHERE user_id=?", (uid,))[0][0] + 1
+            return self.x("INSERT INTO apikeys2(user_id,blob,expires_at,source,created,label,fp) VALUES(?,?,?,?,?,?,?)",
+                          (uid, blob, expires_at, source, int(time.time()), f"کلید {n}", fp))
+
+    def set_apikey(self, uid, blob, expires_at, source):            # legacy single-key API (tests / old callers)
+        import hashlib
+        return self.add_apikey(uid, blob, expires_at, source, "blob:" + hashlib.sha256(bytes(blob)).hexdigest()[:16])
+
+    def apikeys(self, uid, valid_after=None):
+        sql = "SELECT * FROM apikeys2 WHERE user_id=?"
+        args = [uid]
+        if valid_after is not None:
+            sql += " AND (expires_at IS NULL OR expires_at>?)"
+            args.append(int(valid_after))
+        return self.q(sql + " ORDER BY id", args)
+
+    def apikey_by_id(self, uid, kid):
+        r = self.q("SELECT * FROM apikeys2 WHERE user_id=? AND id=?", (uid, kid))
+        return r[0] if r else None
 
     def apikey(self, uid):
-        r = self.q("SELECT * FROM apikeys WHERE user_id=?", (uid,))
+        """Any usable key (latest-expiring) — for read calls (drop info, eligibility)."""
+        r = self.q("SELECT * FROM apikeys2 WHERE user_id=? ORDER BY COALESCE(expires_at, 9e18) DESC, id DESC LIMIT 1", (uid,))
         return r[0] if r else None
+
+    def delete_apikey(self, uid, kid):
+        with self.lock:
+            if self.q("SELECT 1 FROM tasks WHERE apikey_id=? AND user_id=? AND status IN ('scheduled','running')", (kid, uid)):
+                return False
+            self.x("DELETE FROM apikeys2 WHERE id=? AND user_id=?", (kid, uid))
+            return True
+
+    def key_load(self, uid, start, end, margin=600):
+        """{key_id: number of ACTIVE tasks whose stage window overlaps [start-margin, end]}"""
+        rows = self.q("SELECT apikey_id, COUNT(*) n FROM tasks WHERE user_id=? AND status IN ('scheduled','running') "
+                      "AND apikey_id IS NOT NULL AND start_ts < ? AND end_ts > ? GROUP BY apikey_id",
+                      (uid, end, start - margin))
+        return {r["apikey_id"]: r["n"] for r in rows}
+
+    def pick_keys(self, uid, items, margin=600):
+        """Assign a key to each plan item: prefer a key with NO overlapping active task (own rate-limit budget per
+        task), valid until the item's end; else the least loaded valid key. -> [(key_id|None, shared:bool)]"""
+        out, taken = [], {}
+        for it in items:
+            keys = [k for k in self.apikeys(uid) if not k["expires_at"] or k["expires_at"] > it["start"] + 300]
+            if not keys:
+                out.append((None, False)); continue
+            load = self.key_load(uid, it["start"], it["end"], margin)
+            for kid, (_unused, e0) in taken.items():
+                for s1, e1 in e0:
+                    if s1 < it["end"] and e1 > it["start"] - margin:
+                        load[kid] = load.get(kid, 0) + 1
+            best = min(keys, key=lambda k: (load.get(k["id"], 0), -(k["expires_at"] or 9e18), k["id"]))
+            out.append((best["id"], load.get(best["id"], 0) > 0))
+            taken.setdefault(best["id"], (None, []))[1].append((it["start"], it["end"]))
+        # (note: key_load counts ACTIVE tasks in the DB; `taken` adds the items of this plan not yet inserted)
+        return out
+
+    # settings / prefs
+    def setting(self, k, default=None):
+        r = self.q("SELECT v FROM settings WHERE k=?", (k,))
+        return r[0]["v"] if r else default
+
+    def set_setting(self, k, v):
+        self.x("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+
+    PRICE_POLICIES = ("exact", "lower_ok", "cap", "any_up")
+
+    def prefs(self, uid):
+        r = self.q("SELECT * FROM user_prefs WHERE user_id=?", (uid,))
+        return dict(r[0]) if r else {"user_id": uid, "price_policy": "exact", "max_increase_pct": 0}
+
+    def set_prefs(self, uid, policy, pct=0):
+        if policy not in self.PRICE_POLICIES or not 0 <= int(pct) <= 1000:
+            raise ValueError("bad price policy")
+        self.ensure_user(uid)
+        self.x("INSERT INTO user_prefs(user_id,price_policy,max_increase_pct) VALUES(?,?,?) ON CONFLICT(user_id) DO "
+               "UPDATE SET price_policy=excluded.price_policy,max_increase_pct=excluded.max_increase_pct", (uid, policy, int(pct)))
 
     # tasks
     def add_task(self, uid, wid, slug, nft, label, start, end, kind="signed", price_wei=0, max_value_wei=None,
-                 quantity=1, plan_id=None):
+                 quantity=1, plan_id=None, apikey_id=None, min_unit=None, max_unit=None, policy="exact"):
         quantity = int(quantity)
+        lo = int(price_wei) if min_unit is None else int(min_unit)
+        hi = int(price_wei) if max_unit is None else int(max_unit)
         if max_value_wei is None:
-            max_value_wei = int(price_wei) * quantity
-        if kind not in ("signed", "public") or not 1 <= quantity <= 100 or int(price_wei) < 0 \
-                or int(price_wei) * quantity > int(max_value_wei):
+            max_value_wei = hi * quantity
+        if kind not in ("signed", "public") or not 1 <= quantity <= 100 or int(price_wei) < 0 or not 0 <= lo <= hi \
+                or hi * quantity > int(max_value_wei) or policy not in self.PRICE_POLICIES:
             raise ValueError("bad mint policy")
         now = int(time.time())
         return self.x("INSERT INTO tasks(user_id,wallet_id,slug,nft,stage_label,start_ts,end_ts,status,created,updated,"
-                      "kind,price_wei,max_value_wei,quantity,plan_id) VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?,?,?)",
+                      "kind,price_wei,max_value_wei,quantity,plan_id,apikey_id,min_unit_wei,max_unit_wei,price_policy) "
+                      "VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?,?,?,?,?,?,?)",
                       (uid, wid, slug, nft.lower(), label, start, end, now, now, kind, str(int(price_wei)),
-                       str(int(max_value_wei)), quantity, plan_id))
+                       str(int(max_value_wei)), quantity, plan_id, apikey_id,
+                       None if min_unit is None else str(lo), None if max_unit is None else str(hi), policy))
 
     def add_plan(self, uid, wid, slug, nft, items, max_active, plan_id):
         """Atomically insert one task per stage of a plan. items: [{label,start,end,kind,price_wei,quantity}].
@@ -146,27 +254,32 @@ class DB:
         with self.lock:
             if any(self.duplicate_task(uid, wid, nft, it["label"]) for it in items):
                 return "dup"
-            if len(self.tasks(uid, active_only=True)) + len(items) > max_active:
+            if self.active_count(uid) + len(items) > max_active:
                 return "limit"
             for it in items:                                       # validate everything before writing anything
                 if it["kind"] not in ("signed", "public") or not 1 <= int(it["quantity"]) <= 100 or int(it["price_wei"]) < 0:
                     raise ValueError("bad mint policy")
+            keys = self.pick_keys(uid, items)
             self.c.execute("BEGIN IMMEDIATE")
             try:
-                ids = [self.add_task(uid, wid, slug, nft, it["label"], it["start"], it["end"], it["kind"], it["price_wei"],
-                                     int(it["price_wei"]) * int(it["quantity"]), it["quantity"], plan_id) for it in items]
+                ids = []
+                for it, (kid, _shared) in zip(items, keys):
+                    hi = it.get("max_unit", it["price_wei"])
+                    ids.append(self.add_task(uid, wid, slug, nft, it["label"], it["start"], it["end"], it["kind"],
+                                             it["price_wei"], int(hi) * int(it["quantity"]), it["quantity"], plan_id,
+                                             kid, it.get("min_unit"), it.get("max_unit"), it.get("policy", "exact")))
                 self.c.execute("COMMIT")
                 return ids
             except Exception:
                 self.c.execute("ROLLBACK")
                 raise
 
-    def add_task_once(self, uid, wid, slug, nft, label, start, end, max_active, kind="signed", price_wei=0, max_value_wei=None):
+    def add_task_once(self, uid, wid, slug, nft, label, start, end, max_active, kind="signed", price_wei=0, max_value_wei=None):  # legacy
         """Atomic duplicate/limit check + insert. Returns task id, "dup" or "limit"."""
         with self.lock:
             if self.duplicate_task(uid, wid, nft, label):
                 return "dup"
-            if len(self.tasks(uid, active_only=True)) >= max_active:
+            if self.active_count(uid) >= max_active:
                 return "limit"
             return self.add_task(uid, wid, slug, nft, label, start, end, kind, price_wei, max_value_wei)
 
@@ -177,6 +290,9 @@ class DB:
     def tasks(self, uid, active_only=False):
         sql = "SELECT * FROM tasks WHERE user_id=?" + (" AND status IN ('scheduled','running')" if active_only else "")
         return self.q(sql + " ORDER BY id DESC LIMIT 20", (uid,))
+
+    def active_count(self, uid):
+        return self.q("SELECT COUNT(*) FROM tasks WHERE user_id=? AND status IN ('scheduled','running')", (uid,))[0][0]
 
     def active_tasks(self):
         return self.q("SELECT * FROM tasks WHERE status IN ('scheduled','running') ORDER BY start_ts")
