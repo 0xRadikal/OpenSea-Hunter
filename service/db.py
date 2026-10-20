@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   stage_label TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
   status TEXT NOT NULL, pid INTEGER, log_offset INTEGER NOT NULL DEFAULT 0,
   tx_hash TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'signed', price_wei TEXT NOT NULL DEFAULT '0', max_value_wei TEXT NOT NULL DEFAULT '0');
+  kind TEXT NOT NULL DEFAULT 'signed', price_wei TEXT NOT NULL DEFAULT '0', max_value_wei TEXT NOT NULL DEFAULT '0',
+  quantity INTEGER NOT NULL DEFAULT 1, plan_id TEXT);
 CREATE TABLE IF NOT EXISTS payments(
   charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, stars INTEGER NOT NULL,
   payload TEXT NOT NULL, created INTEGER NOT NULL, refunded INTEGER NOT NULL DEFAULT 0);
@@ -40,7 +41,8 @@ class DB:
         self.lock = threading.RLock()
         cols = {r[1] for r in self.c.execute("PRAGMA table_info(tasks)")}
         for col, ddl in (("kind", "TEXT NOT NULL DEFAULT 'signed'"), ("price_wei", "TEXT NOT NULL DEFAULT '0'"),
-                         ("max_value_wei", "TEXT NOT NULL DEFAULT '0'")):
+                         ("max_value_wei", "TEXT NOT NULL DEFAULT '0'"), ("quantity", "INTEGER NOT NULL DEFAULT 1"),
+                         ("plan_id", "TEXT")):
             if col not in cols:                     # migrate DBs created before paid/public support
                 self.c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
 
@@ -124,15 +126,42 @@ class DB:
         return r[0] if r else None
 
     # tasks
-    def add_task(self, uid, wid, slug, nft, label, start, end, kind="signed", price_wei=0, max_value_wei=0):
-        if kind not in ("signed", "public") or int(price_wei) < 0 or int(price_wei) > int(max_value_wei):
+    def add_task(self, uid, wid, slug, nft, label, start, end, kind="signed", price_wei=0, max_value_wei=None,
+                 quantity=1, plan_id=None):
+        quantity = int(quantity)
+        if max_value_wei is None:
+            max_value_wei = int(price_wei) * quantity
+        if kind not in ("signed", "public") or not 1 <= quantity <= 100 or int(price_wei) < 0 \
+                or int(price_wei) * quantity > int(max_value_wei):
             raise ValueError("bad mint policy")
         now = int(time.time())
         return self.x("INSERT INTO tasks(user_id,wallet_id,slug,nft,stage_label,start_ts,end_ts,status,created,updated,"
-                      "kind,price_wei,max_value_wei) VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?)",
-                      (uid, wid, slug, nft.lower(), label, start, end, now, now, kind, str(int(price_wei)), str(int(max_value_wei))))
+                      "kind,price_wei,max_value_wei,quantity,plan_id) VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?,?,?)",
+                      (uid, wid, slug, nft.lower(), label, start, end, now, now, kind, str(int(price_wei)),
+                       str(int(max_value_wei)), quantity, plan_id))
 
-    def add_task_once(self, uid, wid, slug, nft, label, start, end, max_active, kind="signed", price_wei=0, max_value_wei=0):
+    def add_plan(self, uid, wid, slug, nft, items, max_active, plan_id):
+        """Atomically insert one task per stage of a plan. items: [{label,start,end,kind,price_wei,quantity}].
+        All-or-nothing. Returns [ids], "dup" (some stage already has an active task) or "limit"."""
+        with self.lock:
+            if any(self.duplicate_task(uid, wid, nft, it["label"]) for it in items):
+                return "dup"
+            if len(self.tasks(uid, active_only=True)) + len(items) > max_active:
+                return "limit"
+            for it in items:                                       # validate everything before writing anything
+                if it["kind"] not in ("signed", "public") or not 1 <= int(it["quantity"]) <= 100 or int(it["price_wei"]) < 0:
+                    raise ValueError("bad mint policy")
+            self.c.execute("BEGIN IMMEDIATE")
+            try:
+                ids = [self.add_task(uid, wid, slug, nft, it["label"], it["start"], it["end"], it["kind"], it["price_wei"],
+                                     int(it["price_wei"]) * int(it["quantity"]), it["quantity"], plan_id) for it in items]
+                self.c.execute("COMMIT")
+                return ids
+            except Exception:
+                self.c.execute("ROLLBACK")
+                raise
+
+    def add_task_once(self, uid, wid, slug, nft, label, start, end, max_active, kind="signed", price_wei=0, max_value_wei=None):
         """Atomic duplicate/limit check + insert. Returns task id, "dup" or "limit"."""
         with self.lock:
             if self.duplicate_task(uid, wid, nft, label):

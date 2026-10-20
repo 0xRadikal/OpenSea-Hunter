@@ -70,8 +70,13 @@ def test_policy_matrix(kind, price, cap, value, cdkw, ok):
 def test_kind_crossover_refused():
     m = eng(NFT=NFT_A, MINT_KIND="signed", EXPECTED_PRICE=0, MAX_VALUE_WEI=0)
     assert m.validate({"to": m.SD, "data": public_cd(m), "value": "0"}, ME)[0] is False   # public calldata in signed task
+    # public_sale stage served as mintSigned (seen LIVE 2026-10-20, an-asshole: stageIdx 0, window == public stage):
+    # accepted only with the same price / qty / recipient / nft rules
     m = eng(NFT=NFT_A, MINT_KIND="public", EXPECTED_PRICE=0, MAX_VALUE_WEI=0)
-    assert m.validate({"to": m.SD, "data": signed_cd(m), "value": "0"}, ME)[0] is False   # signed calldata in public task
+    assert m.validate({"to": m.SD, "data": signed_cd(m), "value": "0"}, ME)[0] is True
+    assert m.validate({"to": m.SD, "data": signed_cd(m, price=P), "value": "0"}, ME)[0] is False     # other (paid) stage
+    assert m.validate({"to": m.SD, "data": signed_cd(m, q=2), "value": "0"}, ME)[0] is False
+    assert m.validate({"to": m.SD, "data": signed_cd(m, minter="0x" + "3" * 40), "value": "0"}, ME)[0] is False
 
 def test_wrong_target_and_junk():
     m = eng(NFT=NFT_A, MINT_KIND="public", EXPECTED_PRICE=0, MAX_VALUE_WEI=0)
@@ -85,3 +90,48 @@ def test_original_engine_untouched_still_refuses_public():
     o.NFT = NFT_A
     real = json.load(open(os.path.join(ROOT, "fixture_public_anasshole.json")))
     assert o.validate(real, ME)[0] is False            # this is exactly why the live 'Public stage' was refused
+
+
+@pytest.mark.parametrize("kind", ["signed", "public"])
+@pytest.mark.parametrize("q", [1, 2, 3, 10, 100])
+def test_quantity_policy(kind, q):
+    m = eng(NFT=NFT_A, MINT_KIND=kind, EXPECTED_PRICE=P, MAX_VALUE_WEI=P * q, QUANTITY=q)
+    cd = (lambda **k: signed_cd(m, price=P, **k)) if kind == "signed" else (lambda **k: public_cd(m, **k))
+    assert m.validate({"to": m.SD, "data": cd(q=q), "value": str(P * q)}, ME) == (True, "mintSigned" if kind == "signed" else "mintPublic", P * q)
+    assert m.validate({"to": m.SD, "data": cd(q=q), "value": str(P)}, ME)[0] is (q == 1)          # value must be price*qty
+    assert m.validate({"to": m.SD, "data": cd(q=q + 1), "value": str(P * (q + 1))}, ME)[0] is False  # more than confirmed
+    if q > 1:
+        assert m.validate({"to": m.SD, "data": cd(q=q - 1), "value": str(P * (q - 1))}, ME)[0] is False  # qty must be exact
+
+
+def test_quantity_spend_cap():
+    m = eng(NFT=NFT_A, MINT_KIND="public", EXPECTED_PRICE=P, MAX_VALUE_WEI=3 * P - 1, QUANTITY=3)
+    assert m.validate({"to": m.SD, "data": public_cd(m, q=3), "value": str(3 * P)}, ME)[0] is False
+
+
+@pytest.mark.parametrize("want,limit,done,total,maxs,bal,price,exp", [
+    (3, 3, 0, 10, 1000, 10**18, 0, (3, None)),
+    (10, 3, 0, 10, 1000, 10**18, 0, (3, "wallet_limit")),
+    (3, 5, 3, 10, 1000, 10**18, 0, (2, "wallet_limit")),          # cumulative: 3 already minted in an earlier stage
+    (3, 3, 3, 10, 1000, 10**18, 0, (0, "wallet_limit")),
+    (5, 100, 0, 998, 1000, 10**18, 0, (2, "sold_out")),
+    (5, 100, 0, 10, 1000, 3 * 10**15 + 10**14, 10**15, (3, "insufficient_funds")),
+    (5, None, None, None, None, 10**18, 0, (5, None)),            # unknown on-chain state: contract/OpenSea enforce
+    (500, None, None, None, None, 10**18, 0, (100, None)),        # API max 100
+])
+def test_clamp_quantity(want, limit, done, total, maxs, bal, price, exp):
+    m = eng()
+    assert m.clamp_quantity(want, limit, done, total, maxs, bal, price) == exp
+
+
+def test_nonce_gate(tmp_path):
+    m = eng()
+    f = str(tmp_path / "w.nonce")
+    with m.NonceGate(f) as g:
+        assert g.peer_next is None
+        g.write(8)
+    with m.NonceGate(f) as g:
+        assert g.peer_next == 8
+    with m.NonceGate(None) as g:                                     # no file -> no-op
+        assert g.peer_next is None
+        g.write(1)

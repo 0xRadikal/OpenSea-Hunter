@@ -85,4 +85,4 @@ def test_balance_below_price_refused(env):
     a, pk = fu.funded_wallet(P // 2)
     fo.mint["lb"] = lambda m: (200, {"to": fu.SD, "data": fu.public_calldata(m), "value": str(P), "chain": "robinhood"})
     out, res = run(fo, pk, "lb", "public", P, P, time.time() + 50)    # >45 s so balance check happens before T0
-    assert res["holds"] == 0 and fu.nonce(a.address) == 0 and "does not cover mint price" in out, out[-800:]
+    assert res["holds"] == 0 and fu.nonce(a.address) == 0 and res["reason"] == "insufficient_funds", out[-800:]

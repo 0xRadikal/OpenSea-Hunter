@@ -90,18 +90,18 @@ class Service:
         self.db.ensure_user(usr.id, usr.username)
         c.user_data.clear()
         await u.message.reply_text(
-            "سلام 👋\nاین ربات مینت امضادار (Allowlist / OG) دراپ‌های OpenSea روی Robinhood Chain را با سرعت بالا "
-            "و خودکار برای ولت شما انجام می‌دهد.\n\n"
+            "سلام 👋\nاین ربات مینت دراپ‌های OpenSea روی Robinhood Chain (Allowlist و Public، چند مرحله با تعداد دلخواه) "
+            "را با سرعت بالا و خودکار برای ولت شما انجام می‌دهد.\n\n"
             "مراحل: ۱) اشتراک ۲) ثبت ولت ۳) ثبت کلید API شخصی OpenSea ۴) ارسال لینک کالکشن.\n"
             "از «❓ راهنما» توضیحات کامل و نکات امنیتی را بخوانید.", reply_markup=self.menu())
 
     async def help(self, u: Update, c):
         await u.message.reply_text(
             "📘 راهنما\n\n"
-            "• فقط مراحل رایگان و امضادار (signed presale، قیمت ۰) روی Robinhood Chain پشتیبانی می‌شود. "
-            "ربات هرگز تراکنش پولی/پابلیک ارسال نمی‌کند (value=0 قفل است).\n"
-            "• ولت شما باید در allowlist همان مرحله باشد؛ ربات قبل از ثبت تسک با ورود (SIWE) به OpenSea "
-            "واجد شرایط بودن را چک می‌کند.\n"
+            "• دراپ‌های SeaDrop روی Robinhood Chain: مراحل امضادار (Allowlist) و عمومی (Public)، رایگان یا پولی.\n"
+            "• یک لینک ← یک ولت ← چند مرحله با تعداد دلخواه برای هرکدام. ربات allowlist و سقف هر ولت را برای "
+            "هر مرحله چک می‌کند (ورود SIWE به OpenSea) و در لحظهٔ شروع هر مرحله شلیک می‌کند.\n"
+            "• سقف هر ولت در SeaDrop تجمعی است؛ ربات هرگز بیشتر از سقف، عرضه یا قیمت تأییدشده ارسال نمی‌کند.\n"
             "• هر کاربر با کلید API شخصی خودش کار می‌کند (سهمیه OpenSea بین کاربران تقسیم نمی‌شود).\n"
             "• کلیدهای فوری OpenSea ۷ روزه‌اند؛ قبل از هر دراپ مطمئن شوید کلید معتبر است.\n\n"
             "🔐 امنیت:\n"
@@ -326,138 +326,280 @@ class Service:
         except (OpenSeaError, pf.PreflightError, VaultError) as e:
             return await msg.edit_text(f"❌ {e}")
         stages = pf.pick_stages(drop)
+        c.user_data.pop("state", None)
         if not stages:
-            c.user_data.pop("state", None)
             return await msg.edit_text("❌ همهٔ مرحله‌های این دراپ تمام شده‌اند.")
         ok_st, lines = [], []
         for s in stages:
             why = pf.unsupported_reason(s)
-            price = "رایگان" if s["price_wei"] == 0 else (f"{s['price_wei'] / 1e18:.6f} ETH" if s["price_wei"] else "?")
-            kind = {"signed": "امضادار/Allowlist", "public": "عمومی/Public"}.get(s["kind"], s["type"])
-            lines.append(f"{'🟢' if not why else '⛔'} <b>{esc(s['label'])}</b> — {kind} — {price} — {fmt_ts(s['start'])}"
+            lim = pf.stage_wallet_limit(s)
+            lines.append(f"{'🟢' if not why else '⛔'} <b>{esc(s['label'])}</b> — {self.kind_fa(s['kind'], s['type'])} — "
+                         f"{self.price_fa(s['price_wei'])} — سقف هر ولت: {lim if lim else '?'} — {fmt_ts(s['start'])}"
                          + (f"\n   ↳ {esc(why)}" if why else ""))
             if not why:
                 ok_st.append(s)
         txt = (f"<b>{esc(drop.get('collection_name') or slug)}</b>\nقرارداد: <code>{nft}</code>\n"
                f"عرضه: {drop.get('total_supply')}/{drop.get('max_supply')}\n\n" + "\n".join(lines))
-        c.user_data.pop("state", None)
         if not ok_st:
             return await msg.edit_text(txt + "\n\n❌ هیچ مرحلهٔ قابل‌مینتی ندارد.", parse_mode=ParseMode.HTML)
-        c.user_data.update(slug=slug, nft=nft, stages=ok_st)
-        kb = [[IB(f"🎯 {s['label'][:40]}", callback_data=f"st:{i}")] for i, s in enumerate(ok_st)]
-        await msg.edit_text(txt + "\n\nمرحله را انتخاب کنید:", parse_mode=ParseMode.HTML, reply_markup=IM(kb))
+        c.user_data["plan"] = {"step": "wallet", "slug": slug, "nft": nft, "name": drop.get("collection_name") or slug,
+                               "stages": ok_st}
+        ws = self.db.wallets(uid)
+        kb = [[IB(w["address"], callback_data=f"pw:{w['id']}")] for w in ws] + [[IB("✖️ انصراف", callback_data="px")]]
+        await msg.edit_text(txt + "\n\n👛 با کدام ولت مینت شود؟ (ربات برای این ولت allowlist و سقف هر مرحله را چک می‌کند)",
+                            parse_mode=ParseMode.HTML, reply_markup=IM(kb))
 
-    async def pick_stage(self, u: Update, c):
-        q = u.callback_query
-        await q.answer()
-        try:
-            st = c.user_data["stages"][int(q.data.split(":")[1])]
-        except (KeyError, IndexError, ValueError):
-            return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
-        c.user_data["stage"] = st
-        ws = self.db.wallets(q.from_user.id)
-        kb = [[IB(w["address"], callback_data=f"tw:{w['id']}")] for w in ws]
-        await q.message.reply_text(f"مرحله: {st['label']}\nولت را انتخاب کنید:", reply_markup=IM(kb))
+    @staticmethod
+    def kind_fa(kind, typ=None):
+        return {"signed": "امضادار/Allowlist", "public": "عمومی/Public"}.get(kind, typ or "?")
 
-    async def pick_wallet(self, u: Update, c):
+    @staticmethod
+    def price_fa(p):
+        return "رایگان" if p == 0 else (f"{p / 1e18:.6f} ETH" if p else "?")
+
+    async def plan_wallet(self, u: Update, c):
+        """Per-stage pre-check for the chosen wallet: eligibility (SIWE), per-wallet limit, already minted, funds."""
         q = u.callback_query
         await q.answer()
         uid = q.from_user.id
-        st, slug, nft = c.user_data.get("stage"), c.user_data.get("slug"), c.user_data.get("nft")
+        p = c.user_data.get("plan")
         w = self.db.wallet(uid, int(q.data.split(":")[1]))
-        if not (st and slug and w):
+        if not (p and w):
             return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
-        if self.db.duplicate_task(uid, w["id"], nft, st["label"]):
-            return await q.message.reply_text("برای این ولت و مرحله قبلاً تسک فعال دارید.")
-        m = await q.message.reply_text("⏳ پیش‌بررسی: موجودی، NFT فعلی" + (", ورود به OpenSea با ولت و چک allowlist…" if st["kind"] == "signed" else "…"))
-        price = st["price_wei"]
-        report, ok = [], True
+        nft, slug = p["nft"], p["slug"]
+        signed_any = any(s["kind"] == "signed" for s in p["stages"])
+        m = await q.message.reply_text("⏳ پیش‌بررسی ولت: موجودی، تعداد مینت قبلی، سقف هر مرحله"
+                                       + (", ورود به OpenSea با ولت و چک allowlist…" if signed_any else "…"))
         try:
             bal = await self.blocking(pf.check_wallet, w["address"])
-            need = price + pf.WARN_BALANCE_WEI
-            report.append(f"{'✅' if bal >= need else '❌'} موجودی: {bal / 1e18:.6f} ETH (لازم: قیمت {price / 1e18:.6f} + گس ~0.0001)")
-            if bal < price + pf.WARN_BALANCE_WEI // 4:
-                ok = False
-            held = await self.blocking(pf.nft_balance, nft, w["address"])
-            report.append(f"ℹ️ این ولت الان {held} عدد از این NFT دارد (ربات دقیقاً ۱ عدد دیگر مینت می‌کند)")
+            done = await self.blocking(pf.minted_count, nft, w["address"])
         except pf.PreflightError as e:
             return await m.edit_text(f"❌ {e}")
-        # per-wallet limit: SeaDrop refuses if minted_so_far + 1 > limit (counted across all stages)
-        limit = pf.stage_wallet_limit(st)
-        if st["kind"] == "public":
+        pub = None
+        if any(s["kind"] == "public" for s in p["stages"]):
             try:
-                onchain_price, _s, _e, onchain_limit = await self.blocking(pf.onchain_public_drop, nft)
-                limit = onchain_limit                      # on-chain value is what the contract enforces
-                if price > 0 and onchain_price != price:
-                    ok = False
-                    report.append(f"❌ قیمت روی زنجیره ({onchain_price / 1e18:.6f}) با OpenSea ({price / 1e18:.6f}) فرق دارد")
-            except pf.PreflightError as e:
-                report.append(f"⚠️ خواندن تنظیمات مرحله از زنجیره ممکن نشد ({esc(str(e)[:60])}); قبل از ارسال دوباره چک می‌شود")
-        try:
-            done = await self.blocking(pf.minted_count, nft, w["address"])
-            if limit:
-                if done >= limit:
-                    ok = False
-                    report.append(f"❌ این ولت به سقف مینت این مرحله رسیده ({done} از {limit}). مینت بیشتر ممکن نیست.")
-                else:
-                    report.append(f"✅ سقف هر ولت: {done} از {limit} مینت شده")
-        except pf.PreflightError as e:
-            report.append(f"⚠️ تعداد مینت‌های قبلی این ولت خوانده نشد ({esc(str(e)[:60])}); قبل از ارسال دوباره چک می‌شود")
-        if st["kind"] == "public":
-            report.append("ℹ️ مرحلهٔ عمومی: allowlist ندارد")
-        else:
+                pub = await self.blocking(pf.onchain_public_drop, nft)
+            except pf.PreflightError:
+                pub = None
+        el, el_err = {}, None
+        if signed_any:
             try:
                 pk = self.vault.decrypt(uid, w["address"], w["blob"])
                 jwt = await self.blocking(self.os.wallet_jwt, pk)
                 del pk
                 el = await self.blocking(self.os.eligibility, slug, self.user_key(uid), jwt)
-                e = el.get(st["uuid"])
-                if e is True:
-                    report.append("✅ ورود به OpenSea با ولت موفق — ولت در allowlist این مرحله هست")
-                elif e is False:
-                    ok = False
-                    report.append("❌ طبق OpenSea این ولت در allowlist این مرحله نیست")
-                else:
-                    report.append("⚠️ وضعیت allowlist این مرحله از OpenSea برنگشت (در زمان مینت دوباره چک می‌شود)")
             except (OpenSeaError, VaultError) as ex:
-                report.append(f"⚠️ چک allowlist ممکن نشد ({esc(str(ex)[:80])}); در زمان مینت چک می‌شود")
-        k = self.db.apikey(uid)
-        if k["expires_at"] and k["expires_at"] < max(st["start"], time.time()) + 300:
-            ok = False
-            report.append(f"❌ کلید API قبل از شروع مرحله منقضی می‌شود ({fmt_ts(k['expires_at'])}); کلید جدید بگیرید")
-        cost = "رایگان (فقط گس)" if price == 0 else f"<b>{price / 1e18:.6f} ETH</b> + گس"
-        txt = (f"🎯 {esc(slug)} / {esc(st['label'])} ({'عمومی' if st['kind'] == 'public' else 'امضادار'})\n"
-               f"شروع: {fmt_ts(st['start'])}\nولت: <code>{w['address']}</code>\nهزینه: {cost}\n\n" + "\n".join(report))
-        if not ok:
-            return await m.edit_text(txt + "\n\nتسک ساخته نشد.", parse_mode=ParseMode.HTML)
-        c.user_data["confirm"] = {"wid": w["id"], "price": price}
-        warn = (f"\n\n⚠️ با تأیید، ربات اجازه دارد <b>دقیقاً {price / 1e18:.6f} ETH</b> (نه بیشتر) برای ۱ عدد بپردازد. "
-                "اگر سازنده قیمت را بالا ببرد، ربات چیزی نمی‌فرستد.") if price else ""
-        await m.edit_text(txt + warn + "\n\nتأیید می‌کنید؟", parse_mode=ParseMode.HTML,
-                          reply_markup=IM([[IB("✅ ثبت تسک", callback_data="tok"), IB("✖️ انصراف", callback_data="tno")]]))
+                el_err = str(ex)[:80]
+        for s in p["stages"]:
+            s["limit"] = pf.stage_wallet_limit(s)
+            s["note"] = None
+            if s["kind"] == "public" and pub:
+                s["limit"] = pub[3]                                 # the contract enforces the on-chain value
+                if s["price_wei"] > 0 and pub[0] != s["price_wei"]:
+                    s["note"] = f"قیمت روی زنجیره ({pub[0] / 1e18:.6f}) با OpenSea فرق دارد"
+            s["eligible"] = True if s["kind"] == "public" else el.get(s["uuid"])     # public stages have no allowlist
+            room = (s["limit"] - done) if s["limit"] else pf.API_MAX_QTY
+            fund = ((bal - pf.WARN_BALANCE_WEI // 4) // s["price_wei"]) if s["price_wei"] > 0 else pf.API_MAX_QTY
+            s["maxq"] = max(0, min(pf.API_MAX_QTY, room, fund))
+            s["why_no"] = ("طبق OpenSea این ولت در allowlist این مرحله نیست" if s["eligible"] is False else
+                           s["note"] if s["note"] else
+                           f"سقف ولت پر است ({done} از {s['limit']})" if s["limit"] and room <= 0 else
+                           "موجودی برای حتی ۱ عدد کافی نیست" if s["maxq"] < 1 else None)
+            s["qty"] = None
+        p.update(step="select", wid=w["id"], addr=w["address"], bal=bal, done=done, el_err=el_err)
+        await self.render_select(m, p)
 
-    async def confirm(self, u: Update, c):
+    def select_text(self, p):
+        lines = [f"👛 <code>{p['addr']}</code>\nموجودی: {p['bal'] / 1e18:.6f} ETH — مینت‌های قبلی این ولت در این کالکشن: {p['done']}\n"]
+        for s in p["stages"]:
+            elig = {True: "✅ allowlist هست", False: "❌ allowlist نیست"}.get(s["eligible"], "⚠️ allowlist نامعلوم")
+            if s["kind"] == "public":
+                elig = "عمومی (allowlist ندارد)" if s["eligible"] is not False else elig
+            mark = "☑️" if s["qty"] else ("⛔" if s["why_no"] else "⬜")
+            lines.append(f"{mark} <b>{esc(s['label'])}</b> — {self.kind_fa(s['kind'])} — {self.price_fa(s['price_wei'])} — {fmt_ts(s['start'])}\n"
+                         f"   {elig} | Limit {s['limit'] if s['limit'] else '?'} per wallet | "
+                         + (f"↳ {esc(s['why_no'])}" if s["why_no"] else f"قابل مینت برای شما: حداکثر {s['maxq']}")
+                         + (f"\n   🎯 انتخاب شما: <b>{s['qty']} عدد</b>" if s["qty"] else ""))
+        if p.get("el_err"):
+            lines.append(f"\n⚠️ چک allowlist ممکن نشد ({esc(p['el_err'])}); در زمان مینت دوباره چک می‌شود.")
+        lines.append("\nℹ️ سقف هر ولت در SeaDrop <b>تجمعی</b> است: مینت‌های مراحل قبل از سقف مراحل بعد کم می‌شود.")
+        lines.append("مرحله(ها) را انتخاب و تعداد هرکدام را مشخص کنید، بعد «➡️ ادامه».")
+        return "\n".join(lines)
+
+    async def render_select(self, msg, p, new=False):
+        kb = []
+        for i, s in enumerate(p["stages"]):
+            if s["why_no"]:
+                continue
+            kb.append([IB(("☑️ " if s["qty"] else "⬜ ") + s["label"][:30] + (f" × {s['qty']}" if s["qty"] else ""),
+                          callback_data=f"ps:{i}")])
+        if any(s["qty"] for s in p["stages"]):
+            kb.append([IB("➡️ ادامه (خلاصه و تأیید)", callback_data="pn")])
+        kb.append([IB("✖️ انصراف", callback_data="px")])
+        f = msg.reply_text if new else msg.edit_text
+        await f(self.select_text(p), parse_mode=ParseMode.HTML, reply_markup=IM(kb))
+
+    @staticmethod
+    def qty_options(maxq):
+        return [n for n in (1, 2, 3, 5, 10, 20, 50) if n < maxq]
+
+    async def plan_stage(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        p = c.user_data.get("plan")
+        try:
+            i = int(q.data.split(":")[1]); s = p["stages"][i]
+            assert p["step"] in ("select", "qty") and not s["why_no"]
+        except (TypeError, KeyError, IndexError, ValueError, AssertionError):
+            return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
+        if s["qty"]:                                             # tap on a selected stage = deselect
+            s["qty"] = None
+            return await self.render_select(q.message, p)
+        p["step"] = "qty"; p["qi"] = i
+        lim = s["limit"]
+        kb = [[IB(str(n), callback_data=f"pq:{i}:{n}") for n in self.qty_options(s["maxq"])]] if self.qty_options(s["maxq"]) else []
+        kb.append([IB(f"🔝 حداکثر ({s['maxq']})", callback_data=f"pq:{i}:max")])
+        if s["maxq"] > 1:
+            kb.append([IB("✍️ عدد دلخواه", callback_data=f"pq:{i}:c")])
+        kb.append([IB("↩️ برگشت", callback_data="pb")])
+        cost = "" if not s["price_wei"] else f"\nقیمت هر عدد: {s['price_wei'] / 1e18:.6f} ETH"
+        await q.message.edit_text(
+            f"🎯 <b>{esc(s['label'])}</b>\nLimit {lim if lim else '?'} per wallet — سقف هر ولت این مرحله {lim if lim else 'نامشخص'} عدد است"
+            f" (شما قبلاً {p['done']} عدد مینت کرده‌اید).\nحداکثر قابل مینت برای شما: <b>{s['maxq']}</b>{cost}\n\n"
+            "می‌خواهید در این مرحله چند عدد مینت کنید؟", parse_mode=ParseMode.HTML, reply_markup=IM(kb))
+
+    async def plan_qty(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        p = c.user_data.get("plan")
+        try:
+            _, i, v = q.data.split(":"); i = int(i); s = p["stages"][i]
+            assert p["step"] == "qty" and p.get("qi") == i
+        except (TypeError, KeyError, IndexError, ValueError, AssertionError):
+            return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
+        if v == "c":
+            c.user_data["state"] = "await_qty"
+            p["qmsg"] = q.message.message_id
+            return await q.message.reply_text(f"عدد مورد نظر را بفرستید (۱ تا {s['maxq']}). برای انصراف /cancel")
+        n = s["maxq"] if v == "max" else int(v)
+        if not 1 <= n <= s["maxq"]:
+            return await q.message.reply_text(f"عدد باید بین ۱ و {s['maxq']} باشد.")
+        s["qty"] = n; p["step"] = "select"; p.pop("qi", None)
+        await self.render_select(q.message, p)
+
+    async def got_qty(self, u: Update, c):
+        p = c.user_data.get("plan")
+        t = (u.message.text or "").strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+        if not (p and p.get("step") == "qty" and p.get("qi") is not None):
+            c.user_data.pop("state", None)
+            return await u.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
+        s = p["stages"][p["qi"]]
+        if not t.isdigit() or not 1 <= int(t) <= s["maxq"]:
+            return await u.message.reply_text(f"❌ یک عدد بین ۱ و {s['maxq']} بفرستید (یا /cancel).")
+        s["qty"] = int(t); p["step"] = "select"; p.pop("qi", None)
+        c.user_data.pop("state", None)
+        await self.render_select(u.message, p, new=True)
+
+    async def plan_back(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        p = c.user_data.get("plan")
+        if not p or "wid" not in p:
+            return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
+        p["step"] = "select"; p.pop("qi", None); c.user_data.pop("state", None)
+        await self.render_select(q.message, p)
+
+    @staticmethod
+    def project(p):
+        """Expected outcome if every earlier stage mints in full (cumulative per-wallet limit, start order)."""
+        run, out = p["done"], []
+        for s in sorted((s for s in p["stages"] if s["qty"]), key=lambda s: s["start"]):
+            allowed = (s["limit"] - run) if s["limit"] else s["qty"]
+            eff = max(0, min(s["qty"], allowed))
+            out.append((s, eff)); run += eff
+        return out
+
+    async def plan_next(self, u: Update, c):
         q = u.callback_query
         await q.answer()
         uid = q.from_user.id
-        d = c.user_data
-        if q.data == "tno" or not d.get("confirm"):
-            d.clear()
-            return await q.message.reply_text("لغو شد.", reply_markup=self.menu())
+        p = c.user_data.get("plan")
+        if not p or p.get("step") != "select" or not any(s["qty"] for s in p["stages"]):
+            return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
+        proj = self.project(p)
+        total = sum(s["price_wei"] * s["qty"] for s, _ in proj)
+        gas = pf.WARN_BALANCE_WEI * len(proj)
+        lines, ok = [f"📋 <b>خلاصهٔ برنامهٔ مینت</b> — {esc(p['name'])}\n👛 <code>{p['addr']}</code>\n"], True
+        for n, (s, eff) in enumerate(proj, 1):
+            pr, qt = s["price_wei"], s["qty"]
+            cost = "رایگان" if not pr else f"{pr / 1e18:.6f} × {qt} = {pr * qt / 1e18:.6f} ETH"
+            lines.append(f"{n}) <b>{esc(s['label'])}</b> ({self.kind_fa(s['kind'])}) — {fmt_ts(s['start'])}\n"
+                         f"   تعداد: <b>{qt}</b> — {cost}")
+            if eff < s["qty"]:
+                lines.append(f"   ⚠️ اگر مراحل قبلی کامل مینت شوند، به‌خاطر سقف تجمعی ({s['limit']}) در این مرحله فقط "
+                             f"{eff} عدد ممکن است. ربات لحظهٔ شلیک دوباره از روی زنجیره حساب می‌کند و هرگز بیشتر از سقف نمی‌فرستد.")
+        lines.append(f"\n💰 جمع قیمت (حداکثر): {total / 1e18:.6f} ETH + گس (~{gas / 1e18:.4f}) | موجودی: {p['bal'] / 1e18:.6f} ETH")
+        if p["bal"] < total + gas:
+            lines.append("⚠️ موجودی برای همهٔ برنامه کافی نیست؛ ربات در هر مرحله فقط به اندازهٔ موجودی همان لحظه مینت می‌کند.")
+        k = self.db.apikey(uid)
+        last = max(s["start"] for s, _ in proj)
+        if k["expires_at"] and k["expires_at"] < max(last, time.time()) + 300:
+            ok = False
+            lines.append(f"❌ کلید API قبل از شروع آخرین مرحله منقضی می‌شود ({fmt_ts(k['expires_at'])}); کلید جدید بگیرید.")
+        usr = self.db.user(uid)
+        if usr and usr["sub_until"] < last:
+            ok = False
+            lines.append(f"❌ اشتراک شما قبل از شروع آخرین مرحله تمام می‌شود ({fmt_ts(usr['sub_until'])}); اول تمدید کنید.")
+        if len(self.db.tasks(uid, active_only=True)) + len(proj) > self.cfg.max_active_tasks:
+            ok = False
+            lines.append(f"❌ با این برنامه از سقف {self.cfg.max_active_tasks} تسک فعال رد می‌شوید.")
+        lines.append("\n🔒 ربات در هر مرحله دقیقاً قیمت اعلام‌شده × تعداد را می‌پردازد، نه بیشتر؛ اگر سازنده قیمت را بالا ببرد "
+                     "چیزی ارسال نمی‌شود. تعداد هم فقط ممکن است کمتر شود (سقف ولت / عرضه / موجودی)، هرگز بیشتر.")
+        p["step"] = "summary"
+        kb = ([[IB("🚀 تأیید و مسلح کردن", callback_data="pa")]] if ok else []) + \
+             [[IB("✏️ ویرایش", callback_data="pb"), IB("✖️ انصراف", callback_data="px")]]
+        await q.message.edit_text("\n".join(lines) + ("\n\nتأیید می‌کنید؟" if ok else "\n\nبرنامه قابل ثبت نیست."),
+                                  parse_mode=ParseMode.HTML, reply_markup=IM(kb))
+
+    async def plan_arm(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        uid = q.from_user.id
+        p = c.user_data.get("plan")
+        if not p or p.get("step") != "summary":
+            return await q.message.reply_text("این برنامه قبلاً ثبت شده یا منقضی شده است.")
         if (m := self.need_sub(uid)):
             return await q.message.reply_text(m)
-        st, wid, price = d["stage"], d["confirm"]["wid"], d["confirm"]["price"]
-        tid = self.db.add_task_once(uid, wid, d["slug"], d["nft"], st["label"], st["start"], st["end"],
-                                    self.cfg.max_active_tasks, st["kind"], price, price)
-        if tid == "dup":
-            return await q.message.reply_text("این تسک قبلاً ثبت شده.")
-        if tid == "limit":
-            return await q.message.reply_text("سقف تسک فعال پر است.")
-        self.db.audit(uid, "task_add", f"{tid} {d['slug']} {st['label']} {st['kind']} {price}")
-        d.clear()
-        when = "همین الان شروع می‌شود" if st["start"] <= time.time() + self.cfg.spawn_before_s else \
-            f"{self.cfg.spawn_before_s // 60} دقیقه قبل از شروع آماده می‌شود"
-        await q.message.reply_text(f"✅ تسک #{tid} ثبت شد. ربات {when} و نتیجه را همین‌جا اطلاع می‌دهد.", reply_markup=self.menu())
+        p["step"] = "arming"                                     # double taps hit the guard above
+        sel = sorted((s for s in p["stages"] if s["qty"]), key=lambda s: s["start"])
+        items = [{"label": s["label"], "start": s["start"], "end": s["end"], "kind": s["kind"],
+                  "price_wei": s["price_wei"], "quantity": s["qty"]} for s in sel]
+        plan_id = os.urandom(6).hex()
+        res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.cfg.max_active_tasks, plan_id)
+        if res in ("dup", "limit"):
+            p["step"] = "summary"
+            return await q.message.reply_text("برای یکی از این مرحله‌ها با این ولت قبلاً تسک فعال دارید." if res == "dup"
+                                              else "سقف تسک فعال پر است.")
+        self.db.audit(uid, "plan_add", f"{plan_id} {p['slug']} " + ", ".join(f"{t}:{s['label']}x{s['qty']}" for t, s in zip(res, sel)))
+        c.user_data.pop("plan", None)
+        rows = []
+        for t, s in zip(res, sel):
+            when = "همین الان آماده می‌شود" if s["start"] <= time.time() + self.cfg.spawn_before_s else \
+                f"{self.cfg.spawn_before_s // 60} دقیقه قبل از شروع آماده می‌شود"
+            rows.append(f"• تسک #{t}: {s['label']} × {s['qty']} — {fmt_ts(s['start'])} ({when})")
+        await q.message.reply_text("🚀 مسلح شد. ربات منتظر لحظهٔ شروع هر مرحله می‌ماند و همان لحظه شلیک می‌کند:\n"
+                                   + "\n".join(rows) + "\n\nنتیجهٔ هر مرحله همین‌جا اطلاع داده می‌شود.", reply_markup=self.menu())
+
+    async def plan_cancel(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        c.user_data.pop("plan", None); c.user_data.pop("state", None)
+        await q.message.reply_text("لغو شد.", reply_markup=self.menu())
+
+    async def stale(self, u: Update, c):
+        q = u.callback_query
+        await q.answer()
+        await q.message.reply_text("این دکمه مربوط به نسخهٔ قبلی است؛ دوباره «🎯 تسک جدید» را بزنید.")
 
     async def tasks(self, u: Update, c):
         uid = u.effective_user.id
@@ -467,7 +609,7 @@ class Service:
         icon = {"scheduled": "🕒", "running": "⚙️", "minted": "✅", "failed": "❌", "cancelled": "🚫", "ended": "⌛", "not_eligible": "⛔"}
         lines, kb = [], []
         for t in ts[:10]:
-            lines.append(f"{icon.get(t['status'], '•')} #{t['id']} {esc(t['slug'])} / {esc(t['stage_label'])} — {fmt_ts(t['start_ts'])}"
+            lines.append(f"{icon.get(t['status'], '•')} #{t['id']} {esc(t['slug'])} / {esc(t['stage_label'])} × {t['quantity']} — {fmt_ts(t['start_ts'])}"
                          + (f"\n   {esc(t['result'])}" if t["result"] else ""))
             if t["status"] in ("scheduled", "running"):
                 kb.append([IB(f"🚫 لغو #{t['id']}", callback_data=f"tc:{t['id']}")])
@@ -487,22 +629,23 @@ class Service:
         if st == "await_pk":                    # checked FIRST: a key message must never be echoed/routed
             return await self.got_pk(u, c)
         if t in routes:
-            for k in ("state", "confirm", "stage", "stages", "slug", "nft"):   # leaving the task flow
+            for k in ("state", "plan"):                                    # leaving the task flow
                 c.user_data.pop(k, None)
             return await routes[t](u, c)
         if st == "await_key":
             return await self.got_key(u, c)
         if st == "await_link":
             return await self.got_link(u, c)
-        d = c.user_data
-        if d.get("confirm"):                   # a task is waiting for ✅ / ✖️
-            return await u.message.reply_text(
-                "تسک هنوز ثبت نشده. برای ثبت روی «✅ ثبت تسک» و برای لغو روی «✖️ انصراف» زیر پیام پیش‌بررسی بزنید "
-                "(یا /cancel).\nℹ️ هر تسک دقیقاً ۱ عدد مینت می‌کند؛ برای عدد بیشتر بعد از مینت تسک جدید بسازید.")
-        if d.get("stage"):
-            return await u.message.reply_text("ولت را از دکمه‌های پیام قبلی انتخاب کنید (یا /cancel).")
-        if d.get("stages"):
-            return await u.message.reply_text("مرحله را از دکمه‌های پیام قبلی انتخاب کنید (یا /cancel).")
+        if st == "await_qty":
+            return await self.got_qty(u, c)
+        step = (c.user_data.get("plan") or {}).get("step")
+        hint = {"wallet": "ولت را از دکمه‌های پیام قبلی انتخاب کنید",
+                "select": "مرحله‌ها را با دکمه‌های پیام قبلی انتخاب کنید و بعد «➡️ ادامه» را بزنید",
+                "qty": "تعداد را با دکمه‌ها انتخاب کنید (برای عدد دلخواه «✍️ عدد دلخواه» را بزنید)",
+                "summary": "برنامه هنوز ثبت نشده؛ «🚀 تأیید و مسلح کردن» یا «✖️ انصراف» را بزنید",
+                "arming": "در حال ثبت برنامه…"}.get(step)
+        if hint:
+            return await u.message.reply_text(hint + " (یا /cancel).")
         # a pasted private key outside the flow: delete it anyway
         if len(t) in (64, 66) and all(ch in "0123456789abcdefABCDEFx" for ch in t):
             try:
@@ -573,9 +716,14 @@ class Service:
         app.add_handler(CallbackQueryHandler(self.wallet_add, pattern=r"^wadd$"))
         app.add_handler(CallbackQueryHandler(self.wallet_del, pattern=r"^wdel:\d+$"))
         app.add_handler(CallbackQueryHandler(self.key_set, pattern=r"^kset$"))
-        app.add_handler(CallbackQueryHandler(self.pick_stage, pattern=r"^st:\d+$"))
-        app.add_handler(CallbackQueryHandler(self.pick_wallet, pattern=r"^tw:\d+$"))
-        app.add_handler(CallbackQueryHandler(self.confirm, pattern=r"^t(ok|no)$"))
+        app.add_handler(CallbackQueryHandler(self.plan_wallet, pattern=r"^pw:\d+$"))
+        app.add_handler(CallbackQueryHandler(self.plan_stage, pattern=r"^ps:\d+$"))
+        app.add_handler(CallbackQueryHandler(self.plan_qty, pattern=r"^pq:\d+:(\d+|max|c)$"))
+        app.add_handler(CallbackQueryHandler(self.plan_back, pattern=r"^pb$"))
+        app.add_handler(CallbackQueryHandler(self.plan_next, pattern=r"^pn$"))
+        app.add_handler(CallbackQueryHandler(self.plan_arm, pattern=r"^pa$"))
+        app.add_handler(CallbackQueryHandler(self.plan_cancel, pattern=r"^px$"))
+        app.add_handler(CallbackQueryHandler(self.stale, pattern=r"^(st:\d+|tw:\d+|tok|tno)$"))
         app.add_handler(CallbackQueryHandler(self.task_cancel, pattern=r"^tc:\d+$"))
         app.add_handler(PreCheckoutQueryHandler(self.precheckout))
         app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.paid))

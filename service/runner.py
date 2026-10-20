@@ -60,6 +60,8 @@ REASONS = {
     "rpc_unavailable": "اتصال به شبکه برقرار نشد؛ دوباره تلاش کنید",
     "bad_input": "خطای داخلی (به ادمین گزارش شد)",
     "no_transfer_in_receipt": "تراکنش ثبت شد ولی NFTی به این ولت منتقل نشد",
+    "sold_out": "ظرفیت کالکشن تمام شده است",
+    "insufficient_funds": "موجودی ولت برای قیمت مینت کافی نیست",
 }
 HINTS = (
     ("does not cover mint price", "موجودی ولت برای قیمت مینت کافی نیست"),
@@ -83,7 +85,11 @@ def classify(res, log_tail=""):
         return "failed", "پروسهٔ مینت بدون نتیجه تمام شد (به ادمین گزارش شد)"
     if res.get("minted"):
         ids = res.get("token_ids") or []
-        m = "مینت انجام شد" + (f" — توکن #{', #'.join(map(str, ids))}" if ids else "")
+        n, want = len(ids), res.get("wanted") or 1
+        m = f"مینت انجام شد — {n} عدد" + (f" (از {want} درخواستی؛ سقف ولت/موجودی/عرضه اجازهٔ بیشتر نداد)" if n < want else "")
+        if ids:
+            shown = ids if len(ids) <= 12 else ids[:12]
+            m += "\nتوکن: #" + ", #".join(map(str, shown)) + (" …" if len(ids) > 12 else "")
         return "minted", m + (f"\ntx: {res['tx']}" if res.get("tx") else "")
     reason = res.get("reason")
     if reason in REASONS:
@@ -107,6 +113,10 @@ class Runner:
     def log_path(self, tid):
         return os.path.join(self.cfg.log_dir, f"task-{tid}.log")
 
+    def nonce_path(self, wid):
+        """One lock file per wallet: sibling tasks (other stages of the same wallet) coordinate nonces through it."""
+        return os.path.join(self.cfg.log_dir, f"wallet-{int(wid)}.nonce")
+
     # ------------------------------------------------------------------ spawn / cancel
     def spawn(self, t):
         uid, tid = t["user_id"], t["id"]
@@ -121,7 +131,8 @@ class Runner:
             return self._finish(t, "failed", f"خطای رمزگشایی: {e}")
         cmd = [sys.executable, WRAPPER, "--task-id", str(tid), "--slug", t["slug"], "--nft", t["nft"],
                "--label", t["stage_label"], "--start", str(t["start_ts"]), "--end", str(t["end_ts"]),
-               "--kind", t["kind"], "--price-wei", str(t["price_wei"]), "--max-value-wei", str(t["max_value_wei"])] + self.extra_args
+               "--kind", t["kind"], "--price-wei", str(t["price_wei"]), "--max-value-wei", str(t["max_value_wei"]),
+               "--quantity", str(t["quantity"]), "--nonce-file", self.nonce_path(t["wallet_id"])] + self.extra_args
         fd = os.open(self.log_path(tid), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fd, stderr=subprocess.STDOUT,

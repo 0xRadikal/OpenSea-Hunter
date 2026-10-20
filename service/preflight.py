@@ -15,6 +15,7 @@ import os as _os
 READ_RPCS = [u for u in _os.environ.get("OSH_READ_RPCS", "").split(",") if u] or \
     ["https://rpc.mainnet.chain.robinhood.com", "https://robinhood.drpc.org"]
 WARN_BALANCE_WEI = 100_000_000_000_000      # 0.0001 ETH; measured real mint cost 0.00003-0.00005 ETH (fork + mainnet logs)
+API_MAX_QTY = 100                            # OpenSea /drops/{slug}/mint accepts quantity 1..100 (docs)
 
 
 class PreflightError(Exception):

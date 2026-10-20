@@ -55,7 +55,7 @@ def test_public_calldata_refused_zero_tx(env):
 def test_bad_secret_input(env):
     _, fo = env
     p, res = run_wrapper(fo, "", "s1", time.time() + 4, secret="garbage")
-    assert res == {"minted": False, "tx": None, "token_ids": [], "reason": "bad_input", "error": "bad secret input", "holds": -1}
+    assert res["reason"] == "bad_input" and res["minted"] is False and res["holds"] == -1
 
 def test_dry_run_never_broadcasts(env):
     ts, fo = env

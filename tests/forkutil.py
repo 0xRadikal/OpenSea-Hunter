@@ -52,15 +52,15 @@ def register_test_signer():
     raise RuntimeError("signer setup not mined")
 
 
-def signed_calldata(ts, minter, salt, start=None, end=None, price=0):
+def signed_calldata(ts, minter, salt, start=None, end=None, price=0, q=1, max_per_wallet=1):
     import sys
     sys.path.insert(0, ROOT)
     from eip712 import digest
     now = int(time.time())
-    mp = (price, 1, start or now - 60, end or now + 3600, 2, 1000, 1000, True)
+    mp = (price, max_per_wallet, start or now - 60, end or now + 3600, 2, 1000, 1000, True)
     sig = ts.unsafe_sign_hash(digest(NFT, minter, FEE, mp, salt)).signature
     return SEL_SIGNED + encode(["address", "address", "address", "uint256", "(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool)", "uint256", "bytes"],
-                               [NFT, FEE, "0x" + "0" * 40, 1, mp, salt, sig]).hex()
+                               [NFT, FEE, "0x" + "0" * 40, q, mp, salt, sig]).hex()
 
 
 def funded_wallet(eth=10 ** 16):

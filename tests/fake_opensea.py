@@ -11,6 +11,7 @@ class FakeOpenSea:
         self.mint = {}           # slug -> callable(minter) -> (code, body)
         self.active_after = {}   # slug -> ts when active_stage label appears
         self.calls = []
+        self.mint_bodies = []    # every POST /mint body (minter, quantity)
         self.valid_keys = {"k" * 32}
         self.eligible = set()    # lower-case addresses eligible for every stage
         self.contracts = {}      # (chain, addr) -> slug
@@ -71,7 +72,10 @@ class FakeOpenSea:
                     f = outer.mint.get(p[3])
                     if not f:
                         return self._send(404, {"errors": ["not found"]})
-                    code, b = f(body.get("minter"))
+                    outer.mint_bodies.append(body)
+                    import inspect
+                    nargs = len(inspect.signature(f).parameters)
+                    code, b = f(body.get("minter"), body.get("quantity")) if nargs >= 2 else f(body.get("minter"))
                     return self._send(code, b)
                 return self._send(404, {"errors": ["no route"]})
 
