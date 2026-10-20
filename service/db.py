@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS tasks(
   wallet_id INTEGER NOT NULL REFERENCES wallets(id), slug TEXT NOT NULL, nft TEXT NOT NULL,
   stage_label TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
   status TEXT NOT NULL, pid INTEGER, log_offset INTEGER NOT NULL DEFAULT 0,
-  tx_hash TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL);
+  tx_hash TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'signed', price_wei TEXT NOT NULL DEFAULT '0', max_value_wei TEXT NOT NULL DEFAULT '0');
 CREATE TABLE IF NOT EXISTS payments(
   charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, stars INTEGER NOT NULL,
   payload TEXT NOT NULL, created INTEGER NOT NULL, refunded INTEGER NOT NULL DEFAULT 0);
@@ -37,6 +38,11 @@ class DB:
         self.c.execute("PRAGMA foreign_keys=ON")
         self.c.executescript(SCHEMA)
         self.lock = threading.RLock()
+        cols = {r[1] for r in self.c.execute("PRAGMA table_info(tasks)")}
+        for col, ddl in (("kind", "TEXT NOT NULL DEFAULT 'signed'"), ("price_wei", "TEXT NOT NULL DEFAULT '0'"),
+                         ("max_value_wei", "TEXT NOT NULL DEFAULT '0'")):
+            if col not in cols:                     # migrate DBs created before paid/public support
+                self.c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
 
     def q(self, sql, args=()):
         with self.lock:
@@ -118,10 +124,22 @@ class DB:
         return r[0] if r else None
 
     # tasks
-    def add_task(self, uid, wid, slug, nft, label, start, end):
+    def add_task(self, uid, wid, slug, nft, label, start, end, kind="signed", price_wei=0, max_value_wei=0):
+        if kind not in ("signed", "public") or int(price_wei) < 0 or int(price_wei) > int(max_value_wei):
+            raise ValueError("bad mint policy")
         now = int(time.time())
-        return self.x("INSERT INTO tasks(user_id,wallet_id,slug,nft,stage_label,start_ts,end_ts,status,created,updated) "
-                      "VALUES(?,?,?,?,?,?,?,'scheduled',?,?)", (uid, wid, slug, nft.lower(), label, start, end, now, now))
+        return self.x("INSERT INTO tasks(user_id,wallet_id,slug,nft,stage_label,start_ts,end_ts,status,created,updated,"
+                      "kind,price_wei,max_value_wei) VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?)",
+                      (uid, wid, slug, nft.lower(), label, start, end, now, now, kind, str(int(price_wei)), str(int(max_value_wei))))
+
+    def add_task_once(self, uid, wid, slug, nft, label, start, end, max_active, kind="signed", price_wei=0, max_value_wei=0):
+        """Atomic duplicate/limit check + insert. Returns task id, "dup" or "limit"."""
+        with self.lock:
+            if self.duplicate_task(uid, wid, nft, label):
+                return "dup"
+            if len(self.tasks(uid, active_only=True)) >= max_active:
+                return "limit"
+            return self.add_task(uid, wid, slug, nft, label, start, end, kind, price_wei, max_value_wei)
 
     def task(self, tid):
         r = self.q("SELECT * FROM tasks WHERE id=?", (tid,))

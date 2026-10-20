@@ -104,8 +104,8 @@ def test_full_flow(world):
     m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
     m = tg.mark(); tg.text(U, f"https://opensea.io/item/robinhood/{fu.NFT}/3")
     msg = tg.wait_text(U, "مرحله را انتخاب کنید", since=m)[1]
-    assert "OG List" in msg["text"] and "⛔ Public" in msg["text"]                               # paid stage shown but not selectable
-    kb = msg["reply_markup"]["inline_keyboard"]; assert len(kb) == 1
+    assert "OG List" in msg["text"] and "🟢 <b>Public</b>" in msg["text"]                       # paid public now selectable
+    kb = msg["reply_markup"]["inline_keyboard"]; assert len(kb) == 2 and "OG List" in kb[0][0]["text"]
     m = tg.mark(); tg.callback(U, kb[0][0]["callback_data"]); w = tg.wait_text(U, "ولت را انتخاب کنید", since=m)[1]
     m = tg.mark(); tg.callback(U, w["reply_markup"]["inline_keyboard"][0][0]["callback_data"])
     rep = tg.wait_text(U, "تأیید می‌کنید", since=m, timeout=40)[1]["text"]
@@ -132,6 +132,35 @@ def test_full_flow(world):
     tg.wait_text(BAD, "تسک ساخته نشد", since=m, timeout=40)
     assert svc.db.tasks(BAD) == []
 
+    # ---- PAID PUBLIC mint end-to-end: price shown, confirmed, exact value paid on the fork
+    P = 10 ** 15
+    now = int(time.time()); fu.set_public_drop(P, now - 60, now + 3600)
+    c_, pkc = fu.funded_wallet(10 ** 16)
+    pslug = "e2e-paid"
+    fo.drops[pslug] = {"collection_slug": pslug, "collection_name": "Paid Drop", "chain": "robinhood", "drop_type": "seadrop_v1_erc721",
+                       "contract_address": fu.NFT, "total_supply": "51", "max_supply": "1000",
+                       "stages": [{"uuid": "s-p", "label": "Public stage", "stage_type": "public_sale", "price": str(P),
+                                   "price_currency_address": "0x" + "0" * 40, "max_per_wallet": "2",
+                                   "start_time": iso(now - 60), "end_time": iso(now + 3600)}]}
+    fo.active_after[pslug] = 0
+    fo.mint[pslug] = lambda m: (200, {"to": fu.SD, "data": fu.public_calldata(m), "value": str(P), "chain": "robinhood"})
+    add_wallet(tg, U, pkc)
+    m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
+    m = tg.mark(); tg.text(U, f"https://opensea.io/collection/{pslug}/overview")
+    msg = tg.wait_text(U, "مرحله را انتخاب کنید", since=m)[1]
+    assert "0.001000 ETH" in msg["text"] and "شروع شده" in msg["text"]
+    m = tg.mark(); tg.callback(U, "st:0"); w = tg.wait_text(U, "ولت را انتخاب کنید", since=m)[1]
+    btn = [b[0]["callback_data"] for b in w["reply_markup"]["inline_keyboard"] if b[0]["text"].lower() == c_.address.lower()][0]
+    m = tg.mark(); tg.callback(U, btn)
+    rep_ = tg.wait_text(U, "تأیید می‌کنید", since=m, timeout=40)[1]["text"]
+    assert "دقیقاً 0.001000 ETH" in rep_ and "allowlist ندارد" in rep_
+    b0 = fu.eth(c_.address)
+    m = tg.mark(); tg.callback(U, "tok"); tg.wait_text(U, "همین الان شروع می‌شود", since=m)
+    tg.wait_text(U, "مینت انجام شد", timeout=150, since=m)
+    assert fu.holds(c_.address) == 1 and P <= b0 - fu.eth(c_.address) < P + 10 ** 14
+    pt = [t for t in svc.db.tasks(U) if t["slug"] == pslug][0]
+    assert pt["kind"] == "public" and pt["price_wei"] == str(P) and pt["max_value_wei"] == str(P)
+
     # ---- group chats are ignored entirely
     m = tg.mark()
     tg._push({"message": {"message_id": 1, "date": int(time.time()), "chat": {"id": -100, "type": "supergroup"},
@@ -140,16 +169,16 @@ def test_full_flow(world):
     assert not [c for c in tg.calls[m:] if c[0] == "sendMessage" and str(c[1].get("chat_id")) == "-100"]
 
     # ---- admin
-    m = tg.mark(); tg.text(7, "/stats"); tg.wait_text(7, "minted 1", since=m)
+    m = tg.mark(); tg.text(7, "/stats"); tg.wait_text(7, "minted 2", since=m)
     m = tg.mark(); tg.text(U, "/stats"); time.sleep(0.8)
     assert not [c for c in tg.calls[m:] if c[0] == "sendMessage" and str(c[1].get("chat_id")) == str(U)]
 
     # ---- secrets never leave in bot output, never on disk in plaintext
     out = json.dumps([p for _, p in tg.calls], ensure_ascii=False)
-    for s in (pk[2:], pkb[2:], "k" * 32):
+    for s in (pk[2:], pkb[2:], pkc[2:], "k" * 32):
         assert s not in out
     for root, _, files in os.walk(world["cfg"].data_dir):
         for f in files:
             blob = open(os.path.join(root, f), "rb").read()
-            for s in (pk[2:], pkb[2:], "k" * 32):
+            for s in (pk[2:], pkb[2:], pkc[2:], "k" * 32):
                 assert s.encode() not in blob, f

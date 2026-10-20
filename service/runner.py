@@ -88,7 +88,8 @@ class Runner:
         except Exception as e:  # noqa: BLE001
             return self._finish(t, "failed", f"خطای رمزگشایی: {e}")
         cmd = [sys.executable, WRAPPER, "--task-id", str(tid), "--slug", t["slug"], "--nft", t["nft"],
-               "--label", t["stage_label"], "--start", str(t["start_ts"]), "--end", str(t["end_ts"])] + self.extra_args
+               "--label", t["stage_label"], "--start", str(t["start_ts"]), "--end", str(t["end_ts"]),
+               "--kind", t["kind"], "--price-wei", str(t["price_wei"]), "--max-value-wei", str(t["max_value_wei"])] + self.extra_args
         fd = os.open(self.log_path(tid), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fd, stderr=subprocess.STDOUT,

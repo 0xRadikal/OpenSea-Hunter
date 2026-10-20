@@ -305,17 +305,24 @@ class Service:
             return await msg.edit_text(f"❌ {e}")
         stages = pf.pick_stages(drop)
         if not stages:
-            return await msg.edit_text("❌ مرحله‌ای که هنوز تمام نشده باشد ندارد.")
-        free = [s for s in stages if s["free_signed"]]
-        lines = [f"{'🟢' if s['free_signed'] else '⛔'} {esc(s['label'])} — {s['type']} — قیمت {s['price']} wei — "
-                 f"{fmt_ts(s['start'])}" for s in stages]
+            c.user_data.pop("state", None)
+            return await msg.edit_text("❌ همهٔ مرحله‌های این دراپ تمام شده‌اند.")
+        ok_st, lines = [], []
+        for s in stages:
+            why = pf.unsupported_reason(s)
+            price = "رایگان" if s["price_wei"] == 0 else (f"{s['price_wei'] / 1e18:.6f} ETH" if s["price_wei"] else "?")
+            kind = {"signed": "امضادار/Allowlist", "public": "عمومی/Public"}.get(s["kind"], s["type"])
+            lines.append(f"{'🟢' if not why else '⛔'} <b>{esc(s['label'])}</b> — {kind} — {price} — {fmt_ts(s['start'])}"
+                         + (f"\n   ↳ {esc(why)}" if why else ""))
+            if not why:
+                ok_st.append(s)
         txt = (f"<b>{esc(drop.get('collection_name') or slug)}</b>\nقرارداد: <code>{nft}</code>\n"
                f"عرضه: {drop.get('total_supply')}/{drop.get('max_supply')}\n\n" + "\n".join(lines))
-        if not free:
-            c.user_data.pop("state", None)
-            return await msg.edit_text(txt + "\n\n❌ مرحلهٔ رایگانِ امضادار ندارد (فقط این نوع پشتیبانی می‌شود).", parse_mode=ParseMode.HTML)
-        c.user_data.update(state=None, slug=slug, nft=nft, stages=free)
-        kb = [[IB(f"🎯 {s['label'][:40]}", callback_data=f"st:{i}")] for i, s in enumerate(free)]
+        c.user_data.pop("state", None)
+        if not ok_st:
+            return await msg.edit_text(txt + "\n\n❌ هیچ مرحلهٔ قابل‌مینتی ندارد.", parse_mode=ParseMode.HTML)
+        c.user_data.update(slug=slug, nft=nft, stages=ok_st)
+        kb = [[IB(f"🎯 {s['label'][:40]}", callback_data=f"st:{i}")] for i, s in enumerate(ok_st)]
         await msg.edit_text(txt + "\n\nمرحله را انتخاب کنید:", parse_mode=ParseMode.HTML, reply_markup=IM(kb))
 
     async def pick_stage(self, u: Update, c):
@@ -340,43 +347,58 @@ class Service:
             return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
         if self.db.duplicate_task(uid, w["id"], nft, st["label"]):
             return await q.message.reply_text("برای این ولت و مرحله قبلاً تسک فعال دارید.")
-        m = await q.message.reply_text("⏳ پیش‌بررسی: موجودی، NFT فعلی، ورود به OpenSea با ولت و چک allowlist…")
+        m = await q.message.reply_text("⏳ پیش‌بررسی: موجودی، NFT فعلی" + (", ورود به OpenSea با ولت و چک allowlist…" if st["kind"] == "signed" else "…"))
+        price = st["price_wei"]
         report, ok = [], True
         try:
             bal = await self.blocking(pf.check_wallet, w["address"])
-            report.append(f"{'✅' if bal >= pf.WARN_BALANCE_WEI else '⚠️'} موجودی گس: {bal / 1e18:.6f} ETH")
-            if bal < pf.WARN_BALANCE_WEI // 4:
+            need = price + pf.WARN_BALANCE_WEI
+            report.append(f"{'✅' if bal >= need else '❌'} موجودی: {bal / 1e18:.6f} ETH (لازم: قیمت {price / 1e18:.6f} + گس ~0.0001)")
+            if bal < price + pf.WARN_BALANCE_WEI // 4:
                 ok = False
-                report.append("❌ موجودی برای گس کافی نیست")
             held = await self.blocking(pf.nft_balance, nft, w["address"])
             report.append(f"ℹ️ این ولت الان {held} عدد از این NFT دارد (ربات دقیقاً ۱ عدد دیگر مینت می‌کند)")
         except pf.PreflightError as e:
             return await m.edit_text(f"❌ {e}")
-        try:
-            pk = self.vault.decrypt(uid, w["address"], w["blob"])
-            jwt = await self.blocking(self.os.wallet_jwt, pk)
-            del pk
-            el = await self.blocking(self.os.eligibility, slug, self.user_key(uid), jwt)
-            e = el.get(st["uuid"])
-            if e is True:
-                report.append("✅ ورود به OpenSea با ولت موفق — ولت در allowlist این مرحله هست")
-            elif e is False:
-                ok = False
-                report.append("❌ طبق OpenSea این ولت در allowlist این مرحله نیست")
-            else:
-                report.append("⚠️ وضعیت allowlist این مرحله از OpenSea برنگشت (در زمان مینت دوباره چک می‌شود)")
-        except (OpenSeaError, VaultError) as ex:
-            report.append(f"⚠️ چک allowlist ممکن نشد ({esc(str(ex)[:80])}); در زمان مینت چک می‌شود")
+        if st["kind"] == "public":
+            if price > 0:
+                try:
+                    onchain = await self.blocking(pf.onchain_public_price, nft)
+                    if onchain != price:
+                        ok = False
+                        report.append(f"❌ قیمت روی زنجیره ({onchain / 1e18:.6f}) با OpenSea ({price / 1e18:.6f}) فرق دارد")
+                except pf.PreflightError as e:
+                    report.append(f"⚠️ خواندن قیمت روی زنجیره ممکن نشد ({esc(str(e)[:60])}); قبل از ارسال دوباره چک می‌شود")
+            report.append("ℹ️ مرحلهٔ عمومی: allowlist ندارد")
+        else:
+            try:
+                pk = self.vault.decrypt(uid, w["address"], w["blob"])
+                jwt = await self.blocking(self.os.wallet_jwt, pk)
+                del pk
+                el = await self.blocking(self.os.eligibility, slug, self.user_key(uid), jwt)
+                e = el.get(st["uuid"])
+                if e is True:
+                    report.append("✅ ورود به OpenSea با ولت موفق — ولت در allowlist این مرحله هست")
+                elif e is False:
+                    ok = False
+                    report.append("❌ طبق OpenSea این ولت در allowlist این مرحله نیست")
+                else:
+                    report.append("⚠️ وضعیت allowlist این مرحله از OpenSea برنگشت (در زمان مینت دوباره چک می‌شود)")
+            except (OpenSeaError, VaultError) as ex:
+                report.append(f"⚠️ چک allowlist ممکن نشد ({esc(str(ex)[:80])}); در زمان مینت چک می‌شود")
         k = self.db.apikey(uid)
-        if k["expires_at"] and k["expires_at"] < st["start"] + 300:
+        if k["expires_at"] and k["expires_at"] < max(st["start"], time.time()) + 300:
             ok = False
-            report.append(f"❌ کلید API قبل از شروع مرحله منقضی می‌شود ({fmt_ts(k['expires_at'])}); "
-                          "نزدیک‌تر به دراپ کلید جدید بگیرید و دوباره تسک بسازید")
-        txt = f"🎯 {esc(slug)} / {esc(st['label'])}\nشروع: {fmt_ts(st['start'])}\nولت: <code>{w['address']}</code>\n\n" + "\n".join(report)
+            report.append(f"❌ کلید API قبل از شروع مرحله منقضی می‌شود ({fmt_ts(k['expires_at'])}); کلید جدید بگیرید")
+        cost = "رایگان (فقط گس)" if price == 0 else f"<b>{price / 1e18:.6f} ETH</b> + گس"
+        txt = (f"🎯 {esc(slug)} / {esc(st['label'])} ({'عمومی' if st['kind'] == 'public' else 'امضادار'})\n"
+               f"شروع: {fmt_ts(st['start'])}\nولت: <code>{w['address']}</code>\nهزینه: {cost}\n\n" + "\n".join(report))
         if not ok:
             return await m.edit_text(txt + "\n\nتسک ساخته نشد.", parse_mode=ParseMode.HTML)
-        c.user_data["confirm"] = {"wid": w["id"]}
-        await m.edit_text(txt + "\n\nتأیید می‌کنید؟", parse_mode=ParseMode.HTML,
+        c.user_data["confirm"] = {"wid": w["id"], "price": price}
+        warn = (f"\n\n⚠️ با تأیید، ربات اجازه دارد <b>دقیقاً {price / 1e18:.6f} ETH</b> (نه بیشتر) برای ۱ عدد بپردازد. "
+                "اگر سازنده قیمت را بالا ببرد، ربات چیزی نمی‌فرستد.") if price else ""
+        await m.edit_text(txt + warn + "\n\nتأیید می‌کنید؟", parse_mode=ParseMode.HTML,
                           reply_markup=IM([[IB("✅ ثبت تسک", callback_data="tok"), IB("✖️ انصراف", callback_data="tno")]]))
 
     async def confirm(self, u: Update, c):
@@ -389,16 +411,18 @@ class Service:
             return await q.message.reply_text("لغو شد.", reply_markup=self.menu())
         if (m := self.need_sub(uid)):
             return await q.message.reply_text(m)
-        st, wid = d["stage"], d["confirm"]["wid"]
-        if self.db.duplicate_task(uid, wid, d["nft"], st["label"]):
+        st, wid, price = d["stage"], d["confirm"]["wid"], d["confirm"]["price"]
+        tid = self.db.add_task_once(uid, wid, d["slug"], d["nft"], st["label"], st["start"], st["end"],
+                                    self.cfg.max_active_tasks, st["kind"], price, price)
+        if tid == "dup":
             return await q.message.reply_text("این تسک قبلاً ثبت شده.")
-        if len(self.db.tasks(uid, active_only=True)) >= self.cfg.max_active_tasks:
+        if tid == "limit":
             return await q.message.reply_text("سقف تسک فعال پر است.")
-        tid = self.db.add_task(uid, wid, d["slug"], d["nft"], st["label"], st["start"], st["end"])
-        self.db.audit(uid, "task_add", f"{tid} {d['slug']} {st['label']}")
+        self.db.audit(uid, "task_add", f"{tid} {d['slug']} {st['label']} {st['kind']} {price}")
         d.clear()
-        await q.message.reply_text(f"✅ تسک #{tid} ثبت شد. ربات {self.cfg.spawn_before_s // 60} دقیقه قبل از شروع آماده می‌شود "
-                                   "و نتیجه را همین‌جا اطلاع می‌دهد.", reply_markup=self.menu())
+        when = "همین الان شروع می‌شود" if st["start"] <= time.time() + self.cfg.spawn_before_s else \
+            f"{self.cfg.spawn_before_s // 60} دقیقه قبل از شروع آماده می‌شود"
+        await q.message.reply_text(f"✅ تسک #{tid} ثبت شد. ربات {when} و نتیجه را همین‌جا اطلاع می‌دهد.", reply_markup=self.menu())
 
     async def tasks(self, u: Update, c):
         uid = u.effective_user.id

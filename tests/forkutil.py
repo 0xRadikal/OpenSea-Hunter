@@ -71,3 +71,31 @@ def funded_wallet(eth=10 ** 16):
 
 def holds(addr):
     return int(r("eth_call", [{"to": NFT, "data": "0x70a08231" + addr[2:].lower().rjust(64, "0")}, "latest"]), 16)
+
+
+def set_public_drop(price, start, end, max_per_wallet=10):
+    """Owner (impersonated, fork only) sets the AERENT public drop: price/time/limit. feeBps 1000, restricted."""
+    r("anvil_impersonateAccount", [OWNER]); r("anvil_setBalance", [OWNER, hex(10 ** 18)])
+    d = "0x" + keccak(text="updatePublicDrop(address,(uint80,uint48,uint48,uint16,uint16,bool))")[:4].hex() + \
+        encode(["address", "(uint80,uint48,uint48,uint16,uint16,bool)"], [SD, (price, start, end, max_per_wallet, 1000, True)]).hex()
+    h = r("eth_sendTransaction", [{"from": OWNER, "to": NFT, "data": d, "gas": hex(300000)}])
+    for _ in range(50):
+        rc = r("eth_getTransactionReceipt", [h])
+        if rc:
+            assert rc["status"] == "0x1", rc
+            return
+        time.sleep(0.2)
+    raise RuntimeError("updatePublicDrop not mined")
+
+
+def public_calldata(minter, q=1):
+    sel = "0x" + keccak(text="mintPublic(address,address,address,uint256)")[:4].hex()
+    return sel + encode(["address", "address", "address", "uint256"], [NFT, FEE, minter, q]).hex() + "3d958fe2"
+
+
+def eth(addr):
+    return int(r("eth_getBalance", [addr, "latest"]), 16)
+
+
+def nonce(addr):
+    return int(r("eth_getTransactionCount", [addr, "latest"]), 16)

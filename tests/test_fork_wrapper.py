@@ -16,6 +16,7 @@ def env():
 def run_wrapper(fo, pk, slug, start, extra=(), secret=None):
     cmd = [PY, os.path.join(fu.ROOT, "service", "engine_wrapper.py"), "--task-id", "1", "--slug", slug, "--nft", fu.NFT,
            "--label", "OG List", "--start", str(int(start)), "--end", str(int(start) + 3600),
+           "--kind", "signed", "--price-wei", "0", "--max-value-wei", "0",
            "--api-base", fo.url, "--rpc", fu.F, "--no-api-check", *extra]
     p = subprocess.run(cmd, input=(secret if secret is not None else json.dumps({"pk": pk, "api_key": "k" * 32})) + "\n",
                        capture_output=True, text=True, timeout=150)

@@ -34,8 +34,31 @@ def rpc(method, params, rpcs=None):
     raise PreflightError(f"RPC {method} failed: {str(last)[:80]}")
 
 
+ZERO = "0x" + "0" * 40
+
+
+def _price(st):
+    p = str(st.get("price") if st.get("price") is not None else "")
+    return int(p) if p.isdigit() else None
+
+
+def kind_of(st):
+    """'signed' / 'public' if the engine can mint this stage, else None (with reason via unsupported_reason)."""
+    return {"signed_presale": "signed", "public_sale": "public"}.get(st.get("stage_type"))
+
+
+def unsupported_reason(s):
+    if s["kind"] is None:
+        return f"نوع مرحله «{s['type']}» پشتیبانی نمی‌شود"
+    if s["price_wei"] is None:
+        return "قیمت نامشخص است"
+    if s["currency"] != ZERO:
+        return "پرداخت با توکن ERC-20 پشتیبانی نمی‌شود"
+    return None
+
+
 def pick_stages(drop, now=None):
-    """Free signed stages that have not ended, earliest first."""
+    """Stages that have not ended, earliest first (each tagged with kind / price / reason if unsupported)."""
     now = now or time.time()
     out = []
     for st in drop.get("stages") or []:
@@ -49,7 +72,8 @@ def pick_stages(drop, now=None):
                     "type": st.get("stage_type"), "price": st.get("price"),
                     "max_per_wallet": st.get("max_per_wallet"),
                     "currency": (st.get("price_currency_address") or "0x" + "0" * 40).lower(),
-                    "free_signed": st.get("stage_type") == "signed_presale" and str(st.get("price")) == "0"})
+                    "kind": kind_of(st),
+                    "price_wei": _price(st)})
     return sorted(out, key=lambda x: x["start"])
 
 
@@ -92,3 +116,8 @@ def check_wallet(address, rpcs=None):
 
 def nft_balance(nft, address, rpcs=None):
     return int(rpc("eth_call", [{"to": nft, "data": "0x70a08231" + address[2:].lower().rjust(64, "0")}, "latest"], rpcs), 16)
+
+
+def onchain_public_price(nft, rpcs=None):
+    res = rpc("eth_call", [{"to": SD, "data": "0x" + _sel("getPublicDrop(address)") + nft[2:].lower().rjust(64, "0")}, "latest"], rpcs)
+    return int(res[2:66], 16)

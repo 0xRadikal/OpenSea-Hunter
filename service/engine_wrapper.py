@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the proven mint engine (aerent_mint.py) UNCHANGED for one service task.
+"""Run the mint engine (mint_engine.py = aerent_mint.py + mint policy) for one service task.
 
 Only module-level target constants are overridden (the same technique as run_testdrop.py, which minted on
 mainnet). Secrets arrive as ONE JSON line on stdin -> never on argv, in env, or on disk:
@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_engine():
-    sp = importlib.util.spec_from_file_location("aerent_engine", os.path.join(HERE, "aerent_mint.py"))
+    sp = importlib.util.spec_from_file_location("aerent_engine", os.path.join(HERE, "mint_engine.py"))
     m = importlib.util.module_from_spec(sp)
     sp.loader.exec_module(m)
     return m
@@ -31,6 +31,9 @@ def main():
     ap.add_argument("--label", required=True)
     ap.add_argument("--start", type=int, required=True)
     ap.add_argument("--end", type=int, required=True)
+    ap.add_argument("--kind", choices=("signed", "public"), required=True)
+    ap.add_argument("--price-wei", type=int, required=True)      # price the user confirmed
+    ap.add_argument("--max-value-wei", type=int, required=True)  # hard spend cap
     ap.add_argument("--dry-run", action="store_true")
     # testing only (fork + fake OpenSea); never used by the service in production
     ap.add_argument("--api-base")
@@ -54,6 +57,7 @@ def main():
     bot.load_api_keys = lambda *_a, **_k: [api_key]
     bot.SLUG, bot.NFT = a.slug, a.nft.lower()
     bot.STAGE_LABEL, bot.STAGE_START, bot.STAGE_END = a.label, a.start, a.end
+    bot.MINT_KIND, bot.EXPECTED_PRICE, bot.MAX_VALUE_WEI = a.kind, a.price_wei, a.max_value_wei
     if a.api_base:
         bot.API_BASE = a.api_base.rstrip("/") + "/api/v2/drops"
     if a.rpc:
