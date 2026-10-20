@@ -48,6 +48,11 @@ set -a; . /root/osh-bot.env; set +a; .venv/bin/python -m service.bot
 # production: deploy/opensea-hunter-bot.service (KillMode=process so in-flight mints survive restarts)
 ```
 
+## Key page hosting
+Serve `keypage/index.html` over HTTPS (see `deploy/nginx-keypage.conf`) and set `KEYPAGE_URL` to that URL.
+The menu button «⚡ ساخت خودکار کلید API» appears only when `KEYPAGE_URL` is set. `sendData` works only from a
+reply-keyboard WebApp button, which is what the bot uses.
+
 ## Tests
 ```bash
 .venv/bin/python -m pytest -q tests -m "not fork"   # offline
