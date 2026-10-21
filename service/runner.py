@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+from . import ui
+
 log = logging.getLogger("runner")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WRAPPER = os.path.join(ROOT, "service", "engine_wrapper.py")
@@ -115,6 +117,23 @@ def speed_text(sp):
     return "\n".join(out)
 
 
+def result_card(t, status, detail, res=None):
+    """HTML notification card + inline buttons for a finished task. `detail` is the plain-text result."""
+    res = res or {}
+    head = {"minted": ("party", "مینت موفق!"), "failed": ("no", "مینت انجام نشد"), "ended": ("wait", "مرحله تمام شد"),
+            "cancelled": ("stop", "تسک لغو شد"), "not_eligible": ("stop", "خارج از allowlist")}.get(status, ("info", "نتیجهٔ تسک"))
+    body = "\n".join(l for l in (detail or "").splitlines() if not l.startswith("tx: "))
+    txt = (f"{ui.e(head[0])} <b>{head[1]}</b> — تسک #{t['id']}\n"
+           f"{ui.e('gem')} {ui.esc(t['slug'])} · {ui.esc(t['stage_label'])}\n{ui.SEP}\n{ui.esc(body)}")
+    rows = []
+    tx = res.get("tx")
+    if tx:
+        rows.append([ui.btn("مشاهده تراکنش", url=ui.tx_url(tx), icon="search"), ui.btn("کپی tx", copy=tx, icon="link")])
+    if status == "minted":
+        rows.append([ui.btn("کالکشن در OpenSea", url=f"https://opensea.io/collection/{t['slug']}", icon="gem")])
+    return txt, ui.kb(*rows) if rows else None
+
+
 def classify(res, log_tail=""):
     """-> (status, user message). Raw Python errors are never shown to the user."""
     if not res:
@@ -139,9 +158,10 @@ def classify(res, log_tail=""):
 
 
 class Runner:
-    def __init__(self, db, vault, cfg, notify, extra_args=None, admin_notify=None):
+    def __init__(self, db, vault, cfg, notify, extra_args=None, admin_notify=None, notify_rich=None):
         self.db, self.vault, self.cfg, self.notify = db, vault, cfg, notify
         self.admin_notify = admin_notify
+        self.notify_rich = notify_rich               # fn(uid, html, markup, effect) -> formatted cards (bot)
         self.extra_args = list(extra_args or [])    # tests only (fork RPC / fake OpenSea)
         self.procs = {}                              # tid -> Popen (only for children we spawned)
         os.makedirs(cfg.log_dir, mode=0o700, exist_ok=True)
@@ -225,7 +245,11 @@ class Runner:
         self.db.update_task(t["id"], status=status, result=detail[:900], tx_hash=res.get("tx"))
         self.procs.pop(t["id"], None)
         icon = {"minted": "✅", "failed": "❌", "ended": "⌛", "cancelled": "🚫", "not_eligible": "⛔"}.get(status, "ℹ️")
-        self.notify(t["user_id"], f"{icon} تسک #{t['id']} ({t['slug']} / {t['stage_label']}): {detail}")
+        if self.notify_rich:
+            txt, mk = result_card(t, status, detail, res)
+            self.notify_rich(t["user_id"], txt, mk, ui.EFFECT_PARTY if status == "minted" else None)
+        else:
+            self.notify(t["user_id"], f"{icon} تسک #{t['id']} ({t['slug']} / {t['stage_label']}): {detail}")
         if status not in ("minted", "cancelled") and self.admin_notify:      # raw log goes to admins only
             tail = "\n".join(last_lines(self.log_path(t["id"]), 8))
             self.admin_notify(f"[task #{t['id']} user {t['user_id']} -> {status}] {detail}\n{tail[-1500:]}")
@@ -261,8 +285,13 @@ class Runner:
 
     def _pre_warn(self, t):
         if not self.task_key(t):
-            self.notify(t["user_id"], f"⚠️ کلید API شما قبل از پایان مرحلهٔ تسک #{t['id']} منقضی می‌شود. "
-                                      "لطفاً از منوی «🔑 کلید API» کلید جدید ثبت کنید.")
+            msg = (f"⚠️ کلید API شما قبل از پایان مرحلهٔ تسک #{t['id']} منقضی می‌شود. "
+                   "لطفاً از منوی «🔑 کلید API» کلید جدید ثبت کنید.")
+            if self.notify_rich:
+                self.notify_rich(t["user_id"], f"{ui.e('warn')} <b>هشدار کلید API</b>\n{ui.esc(msg[2:])}",
+                                 ui.kb([ui.btn("افزودن کلید API", "kset", style="success", icon="plus")]), None)
+            else:
+                self.notify(t["user_id"], msg)
 
     async def loop(self, period=1.0):
         while True:

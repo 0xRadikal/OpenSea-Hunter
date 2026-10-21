@@ -2,6 +2,7 @@
 import cgi
 import io
 import json
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -68,6 +69,10 @@ class FakeTelegram:
                     if ups or time.time() >= end:
                         return ups
                     self.cv.wait(0.05)
+        if isinstance(p.get("text"), str) and "<tg-emoji" in p["text"]:
+            # keep the raw HTML (premium custom emoji) and expose a plain view for text assertions
+            p["_raw_text"] = p["text"]
+            p["text"] = re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', r"\1", p["text"], flags=re.S)
         with self.cv:
             self.calls.append((method, p)); self.cv.notify_all()
             self.mid += 1

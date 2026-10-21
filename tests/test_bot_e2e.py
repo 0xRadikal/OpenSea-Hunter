@@ -76,7 +76,9 @@ def btn_by(msg, needle):
 
 
 def wallet_btn(msg, addr):
-    return [b[0]["callback_data"] for b in msg["reply_markup"]["inline_keyboard"] if b[0]["text"].lower() == addr.lower()][0]
+    short = f"{addr[:6]}…{addr[-4:]}"
+    return [b[0]["callback_data"] for b in msg["reply_markup"]["inline_keyboard"]
+            if b[0].get("callback_data", "").startswith("pw:") and b[0]["text"] == short][0]
 
 
 def stage_btn(msg, label):
