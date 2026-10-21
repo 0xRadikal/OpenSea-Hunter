@@ -19,6 +19,10 @@ class Config:
     telegram_base_url: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BASE_URL", ""))  # tests only
     max_active_tasks: int = field(default_factory=lambda: int(os.environ.get("MAX_ACTIVE_TASKS", "20")))
     spawn_before_s: int = field(default_factory=lambda: int(os.environ.get("SPAWN_BEFORE_S", "7200")))
+    ton_address: str = field(default_factory=lambda: os.environ.get("TON_ADDRESS", ""))       # receive wallet (TON payments)
+    ton_api_key: str = field(default_factory=lambda: os.environ.get("TONAPI_KEY", ""))
+    ton_api_base: str = field(default_factory=lambda: os.environ.get("TONAPI_BASE", "https://tonapi.io"))
+    price_ton: str = field(default_factory=lambda: os.environ.get("PRICE_TON", ""))          # e.g. "5" (admin /settonprice overrides)
     opensea_base: str = field(default_factory=lambda: os.environ.get("OPENSEA_BASE", "https://api.opensea.io"))
 
     @property

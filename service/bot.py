@@ -27,6 +27,7 @@ from .config import Config
 from .db import DB
 from .opensea import OpenSea, OpenSeaError
 from .runner import Runner
+from . import ton_pay as TP
 from .vault import Vault, VaultError, load_master_key, normalize_private_key
 
 log = logging.getLogger("bot")
@@ -71,6 +72,7 @@ class Service:
         self.os = OpenSea(cfg.opensea_base)
         self.loop = None
         self.app = None
+        self.ton = TP.TonGateway(self.db, cfg, on_event=self._ton_event)
         self.runner = Runner(self.db, self.vault, cfg, self.notify, extra_runner_args, admin_notify=self.notify_admins,
                              notify_rich=self.notify_rich)
 
@@ -232,7 +234,10 @@ class Service:
     # ------------------------------------------------------------------ subscription
     async def sub(self, u: Update, c):
         usr = self.db.ensure_user(u.effective_user.id, u.effective_user.username)
-        plan = [("مدت", f"{self.cfg.sub_days} روز"), ("قیمت", f"{ltr(self.cfg.price_stars)} ⭐ {lt('Telegram Stars')}"),
+        price = f"{ltr(self.cfg.price_stars)} ⭐ {lt('Stars')}"
+        if self.ton.enabled():
+            price += f" یا {ltr(TP.fmt_ton(self.ton.price_nano()) + ' TON')}"
+        plan = [("مدت", f"{self.cfg.sub_days} روز"), ("قیمت", price),
                 ("تسک فعال هم‌زمان", f"تا {ltr(self.max_active())}"), ("ولت", "تا ۵ ولت")]
         if self.db.is_subscribed(usr["id"]):
             left = max(0, usr["sub_until"] - time.time()) / 86400
@@ -240,7 +245,7 @@ class Service:
                  .kv([("وضعیت", f"{e('green')} <b>فعال</b>"), ("باقی‌مانده", f"{ltr(f'{left:.1f}')} روز"),
                       ("پایان", R.when(usr["sub_until"]))])
                  .note(f"تمدید، {self.cfg.sub_days} روز به <b>انتهای</b> اشتراک فعلی اضافه می‌کند.", "idea"))
-            label = f"تمدید {self.cfg.sub_days} روزه — {self.cfg.price_stars} ⭐"
+            label = f"تمدید با Stars — {self.cfg.price_stars} ⭐"
         else:
             d = (Doc().h(f"اشتراک {lt('Ray Minter')}", "gem", 2)
                  .p(f"{e('red')} اشتراک فعال ندارید.")
@@ -249,9 +254,13 @@ class Service:
                              (True, "گزارش سرعت و رتبه بعد از هر مینت"),
                              (True, "واکنش هوشمند به تغییر قیمت")])
                  .kv(plan, caption="پلن")
-                 .footer(f"پرداخت امن داخل تلگرام با {lt('Telegram Stars')}"))
-            label = f"خرید اشتراک {self.cfg.sub_days} روزه — {self.cfg.price_stars} ⭐"
-        await self.say(u, d, kb([btn(label, "buy", style="success", icon="pstar")]))
+                 .footer(f"پرداخت با {lt('Telegram Stars')} داخل تلگرام" + (
+                     f" یا با {lt('TON')} از هر کیف‌پول و صرافی" if self.ton.enabled() else "")))
+            label = f"پرداخت با Stars — {self.cfg.price_stars} ⭐"
+        rows = [[btn(label, "buy", style="success", icon="pstar")]]
+        if self.ton.enabled():
+            rows.append([btn(f"پرداخت با TON — {TP.fmt_ton(self.ton.price_nano())} TON", "tonpay", style="primary", icon="coin")])
+        await self.say(u, d, kb(*rows))
 
     async def buy(self, u: Update, c):
         q = u.callback_query
@@ -282,6 +291,106 @@ class Service:
                  .kv([("اشتراک", f"{e('green')} فعال"), ("تا", R.when(new)), ("مبلغ", f"{ltr(p.total_amount)} ⭐")])
                  .p(f"{e('next')} <b>قدم بعدی:</b> ولت burner و کلید {lt('API')} را ثبت کنید، بعد لینک کالکشن را بفرستید."))
             await self.say(u, d, self.menu(), effect=ui.EFFECT_PARTY)
+
+    # ------------------------------------------------------------------ TON payments
+    def ton_invoice_doc(self, inv, rate=None):
+        a = self.ton.address
+        amt = TP.fmt_ton(inv["amount_nano"])
+        usd = ""
+        if rate:
+            usd_v = rate * inv["amount_nano"] / TP.NANO
+            usd = f" (≈ {ltr(f'${usd_v:,.2f}')})"
+        paid = inv["paid_nano"] - inv["periods"] * inv["price_nano"]
+        d = (Doc().h(f"پرداخت با {lt('TON')}", "coin", 2)
+             .note("از <b>هر کیف‌پول یا صرافی</b> دقیقاً همین مبلغ را با همین کامنت بفرستید؛ "
+                   "پرداخت روی بلاکچین چک و اشتراک <b>خودکار</b> فعال می‌شود.", "bolt")
+             .kv([("مبلغ", f"<b>{mono(amt)}</b> {lt('TON')}{usd}"),
+                  ("آدرس", mono(a)),
+                  ("کامنت (Memo)", f"<b>{mono(inv['memo'])}</b>"),
+                  ("اشتراک", f"{ltr(inv['days'])} روز"),
+                  ("پرداخت‌شده تا الان", f"{ltr(TP.fmt_ton(paid))} {lt('TON')}") if paid > 0 else None,
+                  ("مبلغ یکتا معتبر تا", R.when(inv["expires"]))]))
+        d.checklist([(True, f"کیف‌پول تلگرام، {lt('Tonkeeper')}، {lt('MyTonWallet')}، {lt('Tonhub')} و … : دکمهٔ «باز کردن در کیف‌پول» یا اسکن {lt('QR')}"),
+                     (True, f"صرافی‌ها: آدرس و مبلغ را کپی کنید و <b>کامنت</b> را در فیلد {lt('Memo / Comment / Tag')} بگذارید"),
+                     (True, "اگر صرافی کامنت نمی‌پذیرد: فقط <b>دقیقاً همین مبلغ</b> را تا پیش از پایان اعتبار بفرستید")])
+        d.details(f"{e('info')} نکات مهم",
+                  "<ul><li>مبلغ کمتر از فاکتور حساب می‌شود و باقی‌مانده را می‌توانید با همان کامنت بفرستید.</li>"
+                  "<li>پرداخت با کامنت درست حتی بعد از پایان اعتبار هم ثبت می‌شود.</li>"
+                  f"<li>فقط {lt('TON')} روی شبکهٔ اصلی {lt('TON')} پذیرفته می‌شود (نه توکن یا شبکهٔ دیگر).</li>"
+                  "<li>معمولاً ظرف چند ثانیه تا یک دقیقه بعد از تأیید شبکه، اشتراک فعال می‌شود.</li></ul>")
+        d.footer(f"{e('shield')} هر تراکنش فقط یک‌بار و فقط برای همین فاکتور حساب می‌شود")
+        links = TP.transfer_links(a, inv["amount_nano"], inv["memo"])
+        mk = kb([btn("باز کردن در کیف‌پول", url=links["tonkeeper"], style="success", icon="coin")],
+                [btn("کپی آدرس", copy=a, icon="link"), btn("کپی مبلغ", copy=amt, icon="usd"),
+                 btn("کپی کامنت", copy=inv["memo"], icon="edit")],
+                [btn("پرداخت کردم — بررسی", f"tonchk:{inv['id']}", style="primary", icon="refresh")])
+        return d, mk, links
+
+    async def ton_pay(self, u: Update, c):
+        q = u.callback_query
+        await self.safe_answer(q)
+        uid = q.from_user.id
+        if not self.ton.enabled():
+            return await self.say(q.message, Doc().p(f"{e('warn')} پرداخت با {lt('TON')} فعلاً در دسترس نیست."))
+        self.db.ensure_user(uid, q.from_user.username)
+        try:
+            inv = self.ton.invoice_for(uid)
+        except RuntimeError as ex:
+            log.error("TON invoice failed: %s", ex)
+            return await self.say(q.message, Doc().p(f"{e('warn')} ساخت فاکتور ممکن نشد؛ چند دقیقهٔ دیگر دوباره امتحان کنید."))
+        d, mk, links = self.ton_invoice_doc(inv, await self.ton.api.usd_rate())
+        try:
+            await c.bot.send_photo(uid, TP.qr_png(links["ton"]), caption=f"QR — {TP.fmt_ton(inv['amount_nano'])} TON · {inv['memo']}")
+        except Exception as ex:  # noqa: BLE001 — QR is a convenience; the invoice text has everything
+            log.warning("QR send failed: %s", type(ex).__name__)
+        await self.say(q.message, d, mk)
+
+    async def ton_check(self, u: Update, c):
+        q = u.callback_query
+        uid = q.from_user.id
+        try:
+            inv = self.db.ton_invoice(int(q.data.split(":")[1]))
+        except (IndexError, ValueError):
+            inv = None
+        if not inv or inv["user_id"] != uid:
+            return await self.alert(q, "فاکتور پیدا نشد.")
+        before = inv["paid_nano"]
+        await self.ton.poll_once(force=True)
+        inv = self.db.ton_invoice(inv["id"])
+        if inv["periods"] > 0 and inv["paid_nano"] > before:
+            return await self.safe_answer(q, "پرداخت تأیید شد ✅")
+        if inv["periods"] > 0:
+            return await self.alert(q, "این فاکتور پرداخت شده و اشتراک فعال است ✅", True)
+        if self.ton.healthy is False:
+            return await self.alert(q, "اتصال به شبکهٔ TON موقتاً برقرار نیست؛ پرداخت شما بعداً خودکار بررسی می‌شود.", True)
+        if inv["paid_nano"] > 0:
+            need = (inv["periods"] + 1) * inv["price_nano"] - inv["paid_nano"]
+            return await self.alert(q, f"{TP.fmt_ton(inv['paid_nano'])} TON دریافت شد؛ {TP.fmt_ton(need)} TON دیگر با همان کامنت بفرستید.", True)
+        await self.alert(q, "هنوز پرداختی پیدا نشد. اگر الان فرستادید، تا تأیید شبکه صبر کنید؛ به‌محض دریافت خودکار خبر می‌دهیم.", True)
+
+    def _ton_event(self, kind, data):
+        """Called by the gateway (inside the poll loop) after a transaction has been committed."""
+        inc = data["inc"]
+        link = kb([btn("مشاهدهٔ تراکنش", url=TP.tx_url(inc["hash"]), icon="search")])
+        if kind == "paid":
+            d = (Doc().h("پرداخت TON تأیید شد — خوش آمدید!", "party", 2)
+                 .kv([("اشتراک", f"{e('green')} فعال"), ("تا", R.when(data["until"])),
+                      ("مبلغ دریافتی", f"{ltr(TP.fmt_ton(inc['value']))} {lt('TON')}"),
+                      ("دوره", f"{ltr(data['periods'] * data['days'])} روز")])
+                 .p(f"{e('next')} <b>قدم بعدی:</b> ولت burner و کلید {lt('API')} را ثبت کنید، بعد لینک کالکشن را بفرستید."))
+            self.notify(data["uid"], d, markup=link, effect=ui.EFFECT_PARTY)
+        elif kind == "partial":
+            d = (Doc().h("بخشی از مبلغ دریافت شد", "wait", 3)
+                 .kv([("دریافتی", f"{ltr(TP.fmt_ton(inc['value']))} {lt('TON')}"),
+                      ("باقی‌مانده", f"<b>{ltr(TP.fmt_ton(data['need']))}</b> {lt('TON')}"),
+                      ("کامنت", mono(data["memo"]))])
+                 .note("باقی‌مانده را با <b>همان کامنت</b> بفرستید تا اشتراک فعال شود.", "info"))
+            self.notify(data["uid"], d, markup=link)
+        if kind in ("paid", "partial", "unmatched"):
+            who = f"user {data['uid']} ({data.get('how')})" if data.get("uid") else "UNMATCHED"
+            self.notify_admins(f"💎 TON {kind}: {TP.fmt_ton(inc['value'])} TON — {who}\n"
+                               f"memo: {inc.get('memo') or '-'} | comment: {(inc.get('comment') or '-')[:80]}\n"
+                               f"tx: {inc['hash']}" + ("\n/tonassign <tx> <user_id>" if kind == "unmatched" else ""))
 
     def need_sub(self, uid):
         return None if self.db.is_subscribed(uid) else \
@@ -1177,6 +1286,56 @@ class Service:
         self.db.x("UPDATE users SET banned=? WHERE id=?", (v, uid))
         await self.say(u, f"{e('ok')} ok")
 
+    async def settonprice(self, u: Update, c):
+        """/settonprice <TON>   (0 = disable TON payments). Affects new invoices only."""
+        if not self.is_admin(u):
+            return
+        try:
+            v = c.args[0]
+            nano = 0 if v.strip() in ("0", "off") else TP.parse_ton(v)
+        except (IndexError, ValueError):
+            return await self.say(u, "<code>/settonprice &lt;TON&gt;</code>  e.g. <code>/settonprice 5</code> · <code>0</code> = off")
+        self.db.set_setting("ton_price_nano", nano)
+        self.db.audit(u.effective_user.id, "admin_ton_price", str(nano))
+        await self.say(u, f"{e('ok')} TON price = {TP.fmt_ton(nano) if nano else 'OFF'}"
+                          f"{'' if self.ton.raw else ' (warning: TON_ADDRESS/TONAPI_KEY not configured)'}")
+
+    async def tonassign(self, u: Update, c):
+        """/tonassign <tx_hash> <user_id> [days] — credit an UNMATCHED incoming TON payment by hand."""
+        if not self.is_admin(u):
+            return
+        try:
+            tx, uid = c.args[0].lower(), int(c.args[1])
+            days = float(c.args[2]) if len(c.args) > 2 else self.cfg.sub_days
+            assert re.fullmatch(r"[0-9a-f]{64}", tx) and 0 < days <= 3650
+        except (IndexError, ValueError, AssertionError):
+            return await self.say(u, "<code>/tonassign &lt;tx_hash&gt; &lt;user_id&gt; [days]</code>")
+        until = self.db.ton_assign(tx, uid, days, int(time.time()), u.effective_user.id)
+        if until is None:
+            return await self.say(u, f"{e('no')} not an unmatched TON payment (unknown or already credited)")
+        self.notify(uid, Doc().h("پرداخت TON شما ثبت شد", "party", 3).kv([("اشتراک تا", R.when(until))]))
+        await self.say(u, f"{e('ok')} credited to {uid}, until {fmt_ts(until)}")
+
+    TON_RECEIVED_SQL = "SELECT COALESCE(SUM(value_nano),0) FROM ton_payments WHERE kind IN ('paid','partial','manual')"
+
+    async def tonstatus(self, u: Update, c):
+        if not self.is_admin(u):
+            return
+        q = lambda s_, a=(): self.db.q(s_, a)[0][0]
+        n_open = q("SELECT COUNT(*) FROM ton_invoices WHERE status='open'")
+        n_paid = q("SELECT COUNT(*) FROM ton_invoices WHERE status='paid'")
+        n_un = q("SELECT COUNT(*) FROM ton_payments WHERE kind='unmatched'")
+        got = TP.fmt_ton(q(self.TON_RECEIVED_SQL))
+        price = self.ton.price_nano()
+        lines = [title("coin", "TON"),
+                 f"enabled {self.ton.enabled()} | api {self.ton.healthy}",
+                 f"address <code>{esc(self.ton.address or '-')}</code>",
+                 f"price {TP.fmt_ton(price) if price else '-'} TON | cursor lt {esc(self.db.setting('ton_last_lt'))}",
+                 f"invoices open {n_open} | paid {n_paid} | received {got} TON | unmatched {n_un}"]
+        for r in self.db.ton_unmatched(5):
+            lines.append(f"• <code>{r['tx_hash']}</code> {TP.fmt_ton(r['value_nano'])} TON {esc((r['comment'] or '')[:40])}")
+        await self.say(u, "\n".join(lines))
+
     async def stats(self, u: Update, c):
         if not self.is_admin(u):
             return
@@ -1189,7 +1348,8 @@ class Service:
             f"{title('chart', 'آمار')}\n"
             f"users {q('SELECT COUNT(*) FROM users')} | active subs {q('SELECT COUNT(*) FROM users WHERE sub_until>?', (now,))}\n"
             f"tasks active {active} | minted {minted} | failed {failed}\n"
-            f"stars {q('SELECT COALESCE(SUM(stars),0) FROM payments WHERE refunded=0')}")
+            f"stars {q('SELECT COALESCE(SUM(stars),0) FROM payments WHERE refunded=0')} | "
+            f"ton {TP.fmt_ton(q(self.TON_RECEIVED_SQL))}")
 
     # ------------------------------------------------------------------ wiring
     def build(self) -> Application:
@@ -1221,6 +1381,11 @@ class Service:
         app.add_handler(CommandHandler("setmax", self.setmax, filters=P))
         app.add_handler(CommandHandler("settings", self.settings, filters=P))
         app.add_handler(CommandHandler("new", self.new_task, filters=P))
+        app.add_handler(CommandHandler("settonprice", self.settonprice, filters=P))
+        app.add_handler(CommandHandler("tonassign", self.tonassign, filters=P))
+        app.add_handler(CommandHandler("tonstatus", self.tonstatus, filters=P))
+        app.add_handler(CallbackQueryHandler(self.ton_pay, pattern=r"^tonpay$"))
+        app.add_handler(CallbackQueryHandler(self.ton_check, pattern=r"^tonchk:\d+$"))
         app.add_handler(CallbackQueryHandler(self.buy, pattern=r"^buy$"))
         app.add_handler(CallbackQueryHandler(self.wallet_add, pattern=r"^wadd$"))
         app.add_handler(CallbackQueryHandler(self.wallet_del, pattern=r"^wdel:\d+$"))
@@ -1270,6 +1435,7 @@ class Service:
     async def _post_init(self, app):
         self.loop = asyncio.get_running_loop()
         self._runner_task = asyncio.create_task(self.runner.loop())
+        self._ton_task = asyncio.create_task(self.ton.loop()) if (self.ton.raw and self.cfg.ton_api_key) else None
         asyncio.create_task(self._set_profile(app.bot))
 
     async def _set_profile(self, bot):
@@ -1286,9 +1452,10 @@ class Service:
             log.warning("profile setup skipped: %s", type(ex).__name__)
 
     async def _post_shutdown(self, app):
-        t = getattr(self, "_runner_task", None)
-        if t:
-            t.cancel()
+        for name in ("_runner_task", "_ton_task"):
+            t = getattr(self, name, None)
+            if t:
+                t.cancel()
 
 
 def main():

@@ -33,6 +33,15 @@ CREATE TABLE IF NOT EXISTS user_prefs(
 CREATE TABLE IF NOT EXISTS payments(
   charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, stars INTEGER NOT NULL,
   payload TEXT NOT NULL, created INTEGER NOT NULL, refunded INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS ton_invoices(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, memo TEXT NOT NULL UNIQUE,
+  amount_nano INTEGER NOT NULL, price_nano INTEGER NOT NULL, days INTEGER NOT NULL,
+  created INTEGER NOT NULL, expires INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+  paid_nano INTEGER NOT NULL DEFAULT 0, periods INTEGER NOT NULL DEFAULT 0, paid_at INTEGER);
+CREATE INDEX IF NOT EXISTS ton_inv_open ON ton_invoices(status, expires);
+CREATE TABLE IF NOT EXISTS ton_payments(
+  tx_hash TEXT PRIMARY KEY, lt INTEGER NOT NULL, utime INTEGER NOT NULL, value_nano INTEGER NOT NULL,
+  comment TEXT, memo TEXT, source TEXT, invoice_id INTEGER, user_id INTEGER, kind TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, user_id INTEGER, action TEXT NOT NULL, detail TEXT);
 """
@@ -114,6 +123,121 @@ class DB:
             except sqlite3.IntegrityError:
                 return None
             return self.extend_sub(uid, days)
+
+    # ------------------------------------------------------------------ TON payments (service/ton_pay.py)
+    def ton_invoice_for(self, uid, price, days, now, ttl, memo_fn, step, max_off):
+        """Reuse the user's open, unexpired invoice for the same price/period, else create one whose amount
+        (price + k*step, k in 1..max_off) is unique among all open unexpired invoices."""
+        with self.lock:
+            r = self.q("SELECT * FROM ton_invoices WHERE user_id=? AND status='open' AND price_nano=? AND days=? "
+                       "AND expires>? ORDER BY id DESC LIMIT 1", (uid, price, days, now + 300))
+            if r:
+                return r[0]
+            taken = {x[0] for x in self.q("SELECT amount_nano FROM ton_invoices WHERE status='open' AND expires>?",
+                                          (now - 86400,))}
+            free = [k for k in range(1, max_off + 1) if price + k * step not in taken]
+            if not free:
+                raise RuntimeError("no free unique TON amount (too many open invoices)")
+            amount = price + free[__import__("secrets").randbelow(len(free))] * step
+            for _ in range(20):
+                memo = memo_fn()
+                try:
+                    iid = self.x("INSERT INTO ton_invoices(user_id,memo,amount_nano,price_nano,days,created,expires) "
+                                 "VALUES(?,?,?,?,?,?,?)", (uid, memo, amount, price, days, now, now + ttl))
+                    return self.q("SELECT * FROM ton_invoices WHERE id=?", (iid,))[0]
+                except sqlite3.IntegrityError:
+                    continue
+            raise RuntimeError("could not allocate a unique memo")
+
+    def ton_invoice(self, iid):
+        r = self.q("SELECT * FROM ton_invoices WHERE id=?", (iid,))
+        return r[0] if r else None
+
+    def ton_oldest_open_invoice(self):
+        r = self.q("SELECT MIN(created) FROM ton_invoices WHERE status='open'")
+        return r[0][0] if r and r[0][0] is not None else None
+
+    def ton_has_open_invoices(self, since):
+        return bool(self.q("SELECT 1 FROM ton_invoices WHERE status='open' AND created>? LIMIT 1", (since,)))
+
+    def ton_apply(self, inc, now):
+        """Credit one inbound transfer atomically. inc: dict from ton_pay.incoming().
+        -> ('dup', {}) | ('paid', {...}) | ('partial', {...}) | ('unmatched', {...})"""
+        with self.lock:
+            self.c.execute("BEGIN IMMEDIATE")
+            try:
+                if self.q("SELECT 1 FROM ton_payments WHERE tx_hash=?", (inc["hash"],)):
+                    self.c.execute("ROLLBACK")
+                    return "dup", {}
+                inv = None
+                how = None
+                if inc.get("memo"):
+                    r = self.q("SELECT * FROM ton_invoices WHERE memo=?", (inc["memo"],))
+                    if r and r[0]["status"] != "cancelled":
+                        inv, how = r[0], "memo"
+                if inv is None:
+                    # no (known) memo: exact unique amount of ONE open invoice that was valid when the tx happened
+                    r = self.q("SELECT * FROM ton_invoices WHERE status='open' AND amount_nano=? AND created<=? AND expires>=?",
+                               (inc["value"], inc["utime"] + 120, inc["utime"]))
+                    if len(r) == 1:
+                        inv, how = r[0], "amount"
+                if inv is None:
+                    self.x("INSERT INTO ton_payments(tx_hash,lt,utime,value_nano,comment,memo,source,kind,created) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)", (inc["hash"], inc["lt"], inc["utime"], inc["value"], inc.get("comment"),
+                                                         inc.get("memo"), inc.get("source"), "unmatched", now))
+                    self.c.execute("COMMIT")
+                    return "unmatched", {}
+                total = inv["paid_nano"] + inc["value"]
+                periods = total // inv["price_nano"]                       # several full payments -> several periods
+                new_periods = periods - inv["periods"]
+                until = None
+                if new_periods > 0:
+                    self.ensure_user(inv["user_id"])
+                    until = self.extend_sub(inv["user_id"], inv["days"] * new_periods, now)
+                self.x("UPDATE ton_invoices SET paid_nano=?, periods=?, status=?, paid_at=COALESCE(paid_at, ?) WHERE id=?",
+                       (total, periods, "paid" if periods > 0 else inv["status"], now if periods > 0 else None, inv["id"]))
+                kind = "paid" if new_periods > 0 else "partial"
+                self.x("INSERT INTO ton_payments(tx_hash,lt,utime,value_nano,comment,memo,source,invoice_id,user_id,kind,created) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (inc["hash"], inc["lt"], inc["utime"], inc["value"], inc.get("comment"),
+                                                         inc.get("memo"), inc.get("source"), inv["id"], inv["user_id"], kind, now))
+                self.c.execute("INSERT INTO audit(ts,user_id,action,detail) VALUES(?,?,?,?)",
+                               (now, inv["user_id"], "ton_" + kind, f"inv {inv['id']} {inc['value']} nano by {how} tx {inc['hash']}"))
+                self.c.execute("COMMIT")
+                need = max(0, (inv["periods"] + 1) * inv["price_nano"] - total) if kind == "partial" else 0
+                return kind, {"uid": inv["user_id"], "invoice": inv["id"], "memo": inv["memo"], "until": until,
+                              "periods": new_periods, "total": total, "need": need, "how": how, "days": inv["days"]}
+            except Exception:
+                self.c.execute("ROLLBACK")
+                raise
+
+    def ton_record_history(self, inc, now):
+        """Transfers that existed before the gateway started: stored so they are never processed again, never credited."""
+        self.x("INSERT OR IGNORE INTO ton_payments(tx_hash,lt,utime,value_nano,comment,memo,source,kind,created) "
+               "VALUES(?,?,?,?,?,?,?,?,?)", (inc["hash"], inc["lt"], inc["utime"], inc["value"], inc.get("comment"),
+                                             inc.get("memo"), inc.get("source"), "history", now))
+
+    def ton_assign(self, tx_hash, uid, days, now, admin):
+        """Admin: credit an UNMATCHED recorded payment to a user. -> new expiry or None (unknown / already used)."""
+        with self.lock:
+            self.c.execute("BEGIN IMMEDIATE")
+            try:
+                r = self.q("SELECT kind FROM ton_payments WHERE tx_hash=?", (tx_hash,))
+                if not r or r[0]["kind"] != "unmatched":
+                    self.c.execute("ROLLBACK")
+                    return None
+                self.ensure_user(uid)
+                until = self.extend_sub(uid, days, now)
+                self.x("UPDATE ton_payments SET kind='manual', user_id=? WHERE tx_hash=?", (uid, tx_hash))
+                self.c.execute("INSERT INTO audit(ts,user_id,action,detail) VALUES(?,?,?,?)",
+                               (now, uid, "ton_manual", f"tx {tx_hash} {days}d by admin {admin}"))
+                self.c.execute("COMMIT")
+                return until
+            except Exception:
+                self.c.execute("ROLLBACK")
+                raise
+
+    def ton_unmatched(self, limit=10):
+        return self.q("SELECT * FROM ton_payments WHERE kind='unmatched' ORDER BY lt DESC LIMIT ?", (limit,))
 
     # wallets
     def add_wallet(self, uid, address, blob):
