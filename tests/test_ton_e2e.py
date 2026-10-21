@@ -44,6 +44,11 @@ def world(tmp_path_factory):
     loop.call_soon_threadsafe(loop.stop); tg.close(); api.close()
 
 
+def inv_msg_upload_name(msg):
+    """name of the multipart part that carries the QR (PTB names attach:// parts itself)."""
+    return msg["_rich"]["media"][0]["media"]["media"][len("attach://"):]
+
+
 def buttons(msg):
     return [b for row in msg["reply_markup"]["inline_keyboard"] for b in row]
 
@@ -55,14 +60,21 @@ def test_ton_payment_flow(world):
     m = tg.mark(); tg.text(U, "💳 اشتراک"); sub = tg.wait_text(U, "اشتراک فعال ندارید", since=m)[1]
     assert "500 ⭐ Stars یا 5.0 TON" in sub["text"]
     assert [b.get("callback_data") for b in buttons(sub)] == ["buy", "tonpay"]
+    # every paywall offers BOTH methods (here: «🎯 تسک جدید» without a subscription)
+    m = tg.mark(); tg.text(U, "🎯 تسک جدید"); pw = tg.wait_text(U, "اشتراک فعال لازم", since=m)[1]
+    assert [b.get("callback_data") for b in buttons(pw)] == ["buy", "tonpay"] and "5.0 TON" in buttons(pw)[1]["text"]
     m = tg.mark(); tg.callback(U, "tonpay")
-    photo = tg.wait(lambda c: c[0] == "sendPhoto" and str(c[1].get("chat_id")) == str(U), since=m)[1]
     inv_msg = tg.wait_text(U, "پرداخت با TON", since=m)[1]
+    time.sleep(0.5)
+    assert not [c for c in tg.calls[m:] if c[0] == "sendPhoto"]                       # ONE message, QR inside it
     inv = svc.db.q("SELECT * FROM ton_invoices WHERE user_id=?", (U,))[0]
     amt = T.fmt_ton(inv["amount_nano"])
-    assert inv["memo"] in photo["caption"] and amt in photo["caption"]
+    rm = inv_msg["_rich"]
+    assert '<img src="tg://photo?id=qr"/>' in rm["html"] and rm["media"] == [{"id": "qr", "media": {"type": "photo", "media": "attach://" + inv_msg_upload_name(inv_msg)}}]
+    assert inv_msg[inv_msg_upload_name(inv_msg)][:8] == b"\x89PNG\r\n\x1a\n"
     t = inv_msg["text"]
-    assert f"مبلغ | {amt} TON (≈ $" in t and f"آدرس | {ADDR}" in t and f"کامنت (Memo) | {inv['memo']}" in t
+    assert f"مبلغ | {amt} TON ≈ $" in t and f"آدرس | {ADDR}" in t and f"کامنت | {inv['memo']}" in t
+    assert len(t) < 600, len(t)                                                        # compact
     b = buttons(inv_msg)
     assert b[0]["url"] == f"https://app.tonkeeper.com/transfer/{ADDR}?amount={inv['amount_nano']}&text={inv['memo']}"
     assert [x["copy_text"]["text"] for x in b[1:4]] == [ADDR, amt, inv["memo"]]
@@ -85,7 +97,9 @@ def test_ton_payment_flow(world):
     ok = tg.wait_text(U, "پرداخت TON تأیید شد", since=m, timeout=30)[1]
     assert "دوره | 30 روز" in ok["text"] and ok.get("message_effect_id")
     assert buttons(ok)[0]["url"] == T.tx_url(h)
-    tg.wait_text(7, "TON paid", since=m)
+    adm = tg.wait_text(7, "پرداخت TON — اشتراک فعال شد", since=m)[1]
+    assert f"کاربر | @u{U} · {U}" in adm["text"] and "تطبیق با | کامنت" in adm["text"] and "مبلغ | 3.0 TON" in adm["text"]
+    assert buttons(adm)[0]["url"] == T.tx_url(h)
     assert svc.db.is_subscribed(U)
     # «check» after payment -> confirmed alert
     m = tg.mark(); tg.callback(U, f"tonchk:{inv['id']}")
@@ -93,15 +107,16 @@ def test_ton_payment_flow(world):
     # unknown transfer -> admins get /tonassign hint; admin credits it once
     V = 6002
     m = tg.mark(); h2 = api.pay(4 * T.NANO, "no code here")
-    tg.wait_text(7, "TON unmatched", since=m, timeout=30)
+    un = tg.wait_text(7, "پرداخت TON بدون فاکتور", since=m, timeout=30)[1]
+    assert f"/tonassign {h2}" in un["text"] and "متن کامنت | no code here" in un["text"]
     m = tg.mark(); tg.text(V, f"/tonassign {h2} {V}"); time.sleep(1)                 # non-admin ignored
     assert not svc.db.is_subscribed(V)
     m = tg.mark(); tg.text(7, f"/tonassign {h2} {V}"); tg.wait_text(7, "credited to", since=m)
     assert svc.db.is_subscribed(V)
     m = tg.mark(); tg.text(7, f"/tonassign {h2} {V}"); tg.wait_text(7, "not an unmatched", since=m)
     # admin status + price change + disable
-    m = tg.mark(); tg.text(7, "/tonstatus"); st = tg.wait_text(7, "received", since=m)[1]["text"]
-    assert "received 9.0 TON" in st and "unmatched 0" in st and "paid 1" in st       # 5 (invoice) + 4 (manual)
+    m = tg.mark(); tg.text(7, "/tonstatus"); st = tg.wait_text(7, "داشبورد TON", since=m)[1]["text"]
+    assert "9.0 | 9.0 | 9.0" in st and "بدون فاکتور | 0" in st and "فاکتور پرداخت‌شده | 1" in st   # 5 (invoice) + 4 (manual)
     m = tg.mark(); tg.text(7, "/settonprice 0"); tg.wait_text(7, "TON price = OFF", since=m)
     m = tg.mark(); tg.text(V + 1, "💳 اشتراک"); s2 = tg.wait_text(V + 1, "اشتراک فعال ندارید", since=m)[1]
     assert [b.get("callback_data") for b in buttons(s2)] == ["buy"]

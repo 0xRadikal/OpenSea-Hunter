@@ -83,6 +83,7 @@ class Doc:
 
     def __init__(self):
         self.blocks = []        # (kind, rich_html, classic_html)
+        self.media = {}         # id -> PNG/JPEG bytes, uploaded with the message (rich_message.media + attach://)
 
     def _add(self, kind, rich, classic):
         self.blocks.append((kind, rich, classic))
@@ -157,11 +158,21 @@ class Doc:
     def math(self, tex, classic):
         return self._add("math", f"<tg-math-block>{esc(tex)}</tg-math-block>", classic)
 
+    def image(self, mid, data, caption=None):
+        """Embedded photo (verified live 2026-10-21: <img src="tg://photo?id=…"> + rich_message.media upload).
+        Classic fallback: rich.send sends the image as a photo with the classic text as caption."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mid):
+            raise ValueError("bad media id")
+        self.media[mid] = data
+        cap = f"<figcaption>{caption}</figcaption>" if caption else ""
+        return self._add("img", f'<figure><img src="tg://photo?id={mid}"/>{cap}</figure>', "")
+
     def footer(self, text):
         return self._add("footer", f"<footer>{text}</footer>", f"<i>{text}</i>")
 
     def extend(self, other):
         self.blocks.extend(other.blocks)
+        self.media.update(other.media)
         return self
 
     # ---------------------------------------------------------------- output
@@ -231,6 +242,16 @@ async def send(bot, chat_id, doc, markup=None, effect=None):
     from telegram import Message
     from telegram.constants import ParseMode
     kw = {"chat_id": chat_id, "rich_message": doc.payload()}
+    if doc.media:
+        # PTB uploads top-level InputFile values as multipart parts named by attach_uri; the nested media entries
+        # reference them as plain "attach://<name>" strings (live-verified).
+        from telegram import InputFile
+        media = []
+        for mid, data in doc.media.items():
+            f = InputFile(data, filename=f"{mid}.png", attach=True)
+            kw[f"upload_{mid}"] = f
+            media.append({"id": mid, "media": {"type": "photo", "media": f.attach_uri}})
+        kw["rich_message"]["media"] = media
     if markup is not None:
         kw["reply_markup"] = markup
     if effect:
@@ -241,12 +262,19 @@ async def send(bot, chat_id, doc, markup=None, effect=None):
         if not _fallback_ok(ex):
             raise
         _log_fallback(ex)
+        if doc.media:                                      # one message: first image as photo, text as caption
+            data = next(iter(doc.media.values()))
+            cap = _cut(doc.classic(), 1000)
+            return await bot.send_photo(chat_id, data, caption=cap, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                        message_effect_id=effect)
         return await bot.send_message(chat_id, doc.classic(), parse_mode=ParseMode.HTML, reply_markup=markup,
                                       message_effect_id=effect)
 
 
 async def edit(bot, chat_id, message_id, doc, markup=None):
     from telegram.constants import ParseMode
+    if doc.media:
+        raise ValueError("documents with media are sent as new messages (rich.send), not edited")
     try:
         return await bot.edit_message_text(None, chat_id=chat_id, message_id=message_id, reply_markup=markup,
                                            api_kwargs={"rich_message": doc.payload()})

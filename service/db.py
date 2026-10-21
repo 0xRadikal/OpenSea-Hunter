@@ -92,7 +92,9 @@ class DB:
 
     # users / subscriptions
     def ensure_user(self, uid, username=None):
-        self.x("INSERT INTO users(id,username,created) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username",
+        # username=None (internal calls: extend_sub, payments, admin) must NOT erase a known username
+        self.x("INSERT INTO users(id,username,created) VALUES(?,?,?) "
+               "ON CONFLICT(id) DO UPDATE SET username=COALESCE(excluded.username, users.username)",
                (uid, username, int(time.time())))
         return self.user(uid)
 

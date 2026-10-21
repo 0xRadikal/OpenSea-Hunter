@@ -176,3 +176,34 @@ def test_note_is_pull_quote_with_optional_icon_and_cite():
     d = Doc().note("a<br>b", None, cite="X").note("c", "warn")
     assert d.html().startswith("<aside>a<br>b<cite>X</cite></aside><aside><tg-emoji")
     assert "<blockquote>a\nb — X</blockquote>" in d.classic()
+
+
+def test_image_block_and_media_upload_payload():
+    d = Doc().h("x").image("qr", b"\x89PNG-data").p("y")
+    assert '<figure><img src="tg://photo?id=qr"/></figure>' in d.html() and d.media == {"qr": b"\x89PNG-data"}
+    assert valid_html(d)
+    with pytest.raises(ValueError):
+        Doc().image("bad id!", b"x")
+    b = _Bot()
+    assert run(R.send(b, 5, d)) == "rich"
+    ep, kw = b.calls[0]
+    up = [k for k in kw if k.startswith("upload_")]
+    assert up == ["upload_qr"] and kw["rich_message"]["media"] == [{"id": "qr", "media": {"type": "photo", "media": kw["upload_qr"].attach_uri}}]
+    assert kw["upload_qr"].attach_uri.startswith("attach://")
+
+
+def test_media_doc_falls_back_to_single_photo_with_caption():
+    class PB(_Bot):
+        async def send_photo(self, chat_id, photo, **kw):
+            self.calls.append(("sendPhoto", photo, kw))
+            return "photo"
+    b = PB(BadRequest("Bad Request: rich messages unsupported"))
+    d = Doc().h("عنوان").image("qr", b"PNG").kv([("مبلغ", "5")])
+    assert run(R.send(b, 5, d)) == "photo"
+    assert b.calls[1][0] == "sendPhoto" and b.calls[1][1] == b"PNG" and "مبلغ:" in b.calls[1][2]["caption"]
+    assert len([c for c in b.calls if c[0] in ("sendPhoto", "sendMessage")]) == 1          # still ONE message
+
+
+def test_media_doc_is_never_edited_in_place():
+    with pytest.raises(ValueError):
+        run(R.edit(_Bot(), 5, 9, Doc().image("qr", b"x")))

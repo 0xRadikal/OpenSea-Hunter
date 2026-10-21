@@ -298,3 +298,45 @@ def test_rollback_on_failure_leaves_nothing(gw, monkeypatch):
     assert gw.db.ton_invoice(inv["id"])["paid_nano"] == 0
     run(gw.poll_once())                                                         # retried after the failure
     assert gw.db.is_subscribed(24)
+
+
+def test_encrypted_comment_from_real_payment_uses_unique_amount(gw):
+    """The admin's real test payment (2026-10-21, Tonkeeper) carried an ENCRYPTED comment (op 0x2167da4b);
+    it must be treated as 'no memo' and matched by the unique amount."""
+    boot(gw)
+    inv = gw.invoice_for(30)
+    gw.fake.pay(inv["amount_nano"])
+    t = gw.fake.txs[-1]["in_msg"]
+    t.update({"op_code": "0x2167da4b", "decoded_op_name": "encrypted_text_comment",
+              "decoded_body": {"cipher_text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJIePiGgYKus85THBEmHx5hqc2dvw/TYyDY4uk6qVf"}})
+    inc = T.incoming(gw.fake.txs[-1], RAW)
+    assert inc["encrypted"] is True and inc["memo"] is None and inc["comment"] is None
+    run(gw.poll_once())
+    k, d = gw.ev[-1]
+    assert k == "paid" and d["how"] == "amount" and d["inc"]["encrypted"] is True and gw.db.is_subscribed(30)
+
+
+def test_api_outage_alert_once_and_recovery(gw, monkeypatch):
+    boot(gw)
+    clock = [time.time()]
+    monkeypatch.setattr(T.time, "time", lambda: clock[0])
+    gw.fake.fail = 10 ** 6
+    run(gw.poll_once())                                               # first failure: no alert yet
+    assert not [k for k, _ in gw.ev if k.startswith("api_")]
+    clock[0] += gw.OUTAGE_ALERT_S + 1
+    run(gw.poll_once()); run(gw.poll_once())
+    assert [k for k, _ in gw.ev].count("api_down") == 1             # exactly once
+    gw.fake.fail = 0
+    clock[0] += 60
+    run(gw.poll_once()); run(gw.poll_once())
+    assert [k for k, _ in gw.ev].count("api_up") == 1 and gw.ev[-1][1]["secs"] > 0 if gw.ev[-1][0] == "api_up" else True
+    assert [k for k, _ in gw.ev][-1] == "api_up"
+
+
+def test_short_blip_does_not_alert(gw):
+    boot(gw)
+    gw.fake.fail = 10
+    run(gw.poll_once())
+    gw.fake.fail = 0
+    run(gw.poll_once())
+    assert not [k for k, _ in gw.ev if k.startswith("api_")]

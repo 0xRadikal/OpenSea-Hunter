@@ -157,3 +157,14 @@ def test_prefs_settings_and_policy_columns(tmp_path):
     for i in range(30):
         db.add_task(1, wid, "s", "0x" + "c" * 40, f"L{i}", 1, 2)
     assert db.active_count(1) == 31                               # not capped at 20 like tasks()
+
+
+def test_internal_ensure_user_keeps_username(tmp_path):
+    """Regression: extend_sub/grant/payments call ensure_user(uid) without a username; that must not erase it."""
+    from service.db import DB
+    d = DB(str(tmp_path / "u.db"))
+    d.ensure_user(1, "alice")
+    d.extend_sub(1, 30)
+    assert d.user(1)["username"] == "alice"
+    d.ensure_user(1, "bob")
+    assert d.user(1)["username"] == "bob"

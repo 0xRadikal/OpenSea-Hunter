@@ -81,6 +81,12 @@ class FakeTelegram:
                 with self.cv:
                     self.calls.append((method + ":rejected", p)); self.cv.notify_all()
                 return (404, "Not Found") if method == "sendRichMessage" else (400, "Bad Request: rich messages unsupported")
+            for m in p["rich_message"].get("media") or []:          # like Telegram: attach:// must be uploaded
+                ref = str(m.get("media", {}).get("media", ""))
+                if ref.startswith("attach://") and not isinstance(p.get(ref[9:]), (bytes, bytearray)):
+                    return (400, f"Bad Request: file {ref} not found")
+                if f'tg://photo?id={m.get("id")}' not in p["rich_message"].get("html", ""):
+                    return (400, "Bad Request: media is not used")
             p["_rich"] = p["rich_message"]
             p["text"] = rich_text(p["rich_message"].get("html", ""))
         elif isinstance(p.get("text"), str) and "<tg-emoji" in p["text"]:

@@ -128,9 +128,12 @@ def incoming(tx, our_raw):
         comment = None
         if im.get("decoded_op_name") == "text_comment" and isinstance(im.get("decoded_body"), dict):
             comment = str(im["decoded_body"].get("text") or "")[:500]
+        # Tonkeeper & co. can send an ENCRYPTED comment (op 0x2167da4b, seen live 2026-10-21 on a real payment):
+        # only the receiver's private key can read it, so it is treated as "no memo" (unique-amount matching).
+        encrypted = im.get("decoded_op_name") == "encrypted_text_comment" or str(im.get("op_code") or "").lower() == "0x2167da4b"
         src = (im.get("source") or {}).get("address")
         return {"hash": str(tx["hash"]).lower(), "lt": int(tx["lt"]), "utime": int(tx["utime"]), "value": value,
-                "comment": comment, "memo": extract_memo(comment), "source": src}
+                "comment": comment, "memo": extract_memo(comment), "source": src, "encrypted": encrypted}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -226,6 +229,7 @@ class TonGateway:
                 log.error("TON gateway disabled: invalid TON_ADDRESS (%s)", ex)
         self.api = TonApi(cfg.ton_api_key, cfg.ton_api_base)
         self._poll_lock = asyncio.Lock()
+        self._down_since, self._down_alerted = None, False
         self._last_poll = 0.0
         self.healthy = None
 
@@ -287,11 +291,29 @@ class TonGateway:
                             self.db.set_setting("ton_last_lt", cur)
                         if len(txs) < 100:
                             break
-                self.healthy = True
+                self._set_health(True, None)
             except (TonApiError, KeyError, TypeError, ValueError) as ex:
-                self.healthy = False
+                self._set_health(False, str(ex))
                 log.warning("TON poll failed: %s", ex)
             return n
+
+    OUTAGE_ALERT_S = 300                         # admins are told after 5 min of failures (not on every blip)
+
+    def _set_health(self, ok, err):
+        """Track API health; emit 'api_down' once after OUTAGE_ALERT_S of continuous failures and 'api_up' once
+        when it recovers after such an alert."""
+        now = time.time()
+        if ok:
+            if getattr(self, "_down_alerted", False):
+                self.on_event("api_up", {"since": self._down_since, "secs": now - self._down_since})
+            self._down_since, self._down_alerted = None, False
+        else:
+            if getattr(self, "_down_since", None) is None:
+                self._down_since = now
+            if not getattr(self, "_down_alerted", False) and now - self._down_since >= self.OUTAGE_ALERT_S:
+                self._down_alerted = True
+                self.on_event("api_down", {"since": self._down_since, "error": err})
+        self.healthy = ok
 
     def _apply(self, tx):
         inc = incoming(tx, self.raw)

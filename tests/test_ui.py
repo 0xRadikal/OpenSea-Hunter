@@ -32,10 +32,10 @@ class _RichCheck(_Check):
     """Rich-HTML subset of Bot API 10.3 (tags used by service/rich.py, per core.telegram.org/bots/api#rich-html-style)."""
     OK = _Check.OK | {"p", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "br", "ul", "ol", "li", "input", "table", "caption",
                       "tr", "td", "th", "details", "summary", "aside", "footer", "cite", "tg-math", "tg-math-block",
-                      "mark", "sub", "sup"}
-    VOID = {"hr", "br", "input"}
+                      "mark", "sub", "sup", "figure", "img", "figcaption"}
+    VOID = {"hr", "br", "input", "img"}
     BLOCK = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "ul", "ol", "table", "details", "aside", "footer", "blockquote",
-             "tg-math-block"}
+             "tg-math-block", "figure"}
 
     def __init__(self):
         super().__init__()

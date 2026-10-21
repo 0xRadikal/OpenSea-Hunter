@@ -86,9 +86,9 @@ class Service:
     def notify_rich(self, uid, doc, markup=None, effect=None):
         self.notify(uid, doc, html_=True, markup=markup, effect=effect)
 
-    def notify_admins(self, text):
+    def notify_admins(self, text, markup=None):
         for a in self.cfg.admin_ids:
-            self.notify(a, text)
+            self.notify(a, text, markup=markup)
 
     async def _send(self, uid, text, html_=False, markup=None, effect=None):
         try:
@@ -245,7 +245,7 @@ class Service:
                  .kv([("وضعیت", f"{e('green')} <b>فعال</b>"), ("باقی‌مانده", f"{ltr(f'{left:.1f}')} روز"),
                       ("پایان", R.when(usr["sub_until"]))])
                  .note(f"تمدید، {self.cfg.sub_days} روز به <b>انتهای</b> اشتراک فعلی اضافه می‌کند.", "idea"))
-            label = f"تمدید با Stars — {self.cfg.price_stars} ⭐"
+            renew = True
         else:
             d = (Doc().h(f"اشتراک {lt('Ray Minter')}", "gem", 2)
                  .p(f"{e('red')} اشتراک فعال ندارید.")
@@ -256,11 +256,8 @@ class Service:
                  .kv(plan, caption="پلن")
                  .footer(f"پرداخت با {lt('Telegram Stars')} داخل تلگرام" + (
                      f" یا با {lt('TON')} از هر کیف‌پول و صرافی" if self.ton.enabled() else "")))
-            label = f"پرداخت با Stars — {self.cfg.price_stars} ⭐"
-        rows = [[btn(label, "buy", style="success", icon="pstar")]]
-        if self.ton.enabled():
-            rows.append([btn(f"پرداخت با TON — {TP.fmt_ton(self.ton.price_nano())} TON", "tonpay", style="primary", icon="coin")])
-        await self.say(u, d, kb(*rows))
+            renew = False
+        await self.say(u, d, kb(*self.pay_rows(renew)))
 
     async def buy(self, u: Update, c):
         q = u.callback_query
@@ -294,36 +291,28 @@ class Service:
 
     # ------------------------------------------------------------------ TON payments
     def ton_invoice_doc(self, inv, rate=None):
+        """ONE compact message: QR + amount / address / memo + 3 short steps. Details stay behind a collapsed block."""
         a = self.ton.address
         amt = TP.fmt_ton(inv["amount_nano"])
+        links = TP.transfer_links(a, inv["amount_nano"], inv["memo"])
         usd = ""
         if rate:
-            usd_v = rate * inv["amount_nano"] / TP.NANO
-            usd = f" (≈ {ltr(f'${usd_v:,.2f}')})"
+            usd = " ≈ " + ltr("$" + format(rate * inv["amount_nano"] / TP.NANO, ",.2f"))
         paid = inv["paid_nano"] - inv["periods"] * inv["price_nano"]
-        d = (Doc().h(f"پرداخت با {lt('TON')}", "coin", 2)
-             .note("از <b>هر کیف‌پول یا صرافی</b> دقیقاً همین مبلغ را با همین کامنت بفرستید؛ "
-                   "پرداخت روی بلاکچین چک و اشتراک <b>خودکار</b> فعال می‌شود.", "bolt")
+        d = (Doc().h(f"پرداخت با {lt('TON')} — {ltr(inv['days'])} روز", "coin", 3)
+             .image("qr", TP.qr_png(links["ton"]))
              .kv([("مبلغ", f"<b>{mono(amt)}</b> {lt('TON')}{usd}"),
                   ("آدرس", mono(a)),
-                  ("کامنت (Memo)", f"<b>{mono(inv['memo'])}</b>"),
-                  ("اشتراک", f"{ltr(inv['days'])} روز"),
-                  ("پرداخت‌شده تا الان", f"{ltr(TP.fmt_ton(paid))} {lt('TON')}") if paid > 0 else None,
-                  ("مبلغ یکتا معتبر تا", R.when(inv["expires"]))]))
-        d.checklist([(True, f"کیف‌پول تلگرام، {lt('Tonkeeper')}، {lt('MyTonWallet')}، {lt('Tonhub')} و … : دکمهٔ «باز کردن در کیف‌پول» یا اسکن {lt('QR')}"),
-                     (True, f"صرافی‌ها: آدرس و مبلغ را کپی کنید و <b>کامنت</b> را در فیلد {lt('Memo / Comment / Tag')} بگذارید"),
-                     (True, "اگر صرافی کامنت نمی‌پذیرد: فقط <b>دقیقاً همین مبلغ</b> را تا پیش از پایان اعتبار بفرستید")])
-        d.details(f"{e('info')} نکات مهم",
-                  "<ul><li>مبلغ کمتر از فاکتور حساب می‌شود و باقی‌مانده را می‌توانید با همان کامنت بفرستید.</li>"
-                  "<li>پرداخت با کامنت درست حتی بعد از پایان اعتبار هم ثبت می‌شود.</li>"
-                  f"<li>فقط {lt('TON')} روی شبکهٔ اصلی {lt('TON')} پذیرفته می‌شود (نه توکن یا شبکهٔ دیگر).</li>"
-                  "<li>معمولاً ظرف چند ثانیه تا یک دقیقه بعد از تأیید شبکه، اشتراک فعال می‌شود.</li></ul>")
-        d.footer(f"{e('shield')} هر تراکنش فقط یک‌بار و فقط برای همین فاکتور حساب می‌شود")
-        links = TP.transfer_links(a, inv["amount_nano"], inv["memo"])
+                  ("کامنت", f"<b>{mono(inv['memo'])}</b>"),
+                  ("پرداخت‌شده", f"{ltr(TP.fmt_ton(paid))} {lt('TON')}") if paid > 0 else None])
+             .note("QR را اسکن کنید یا «باز کردن در کیف‌پول» را بزنید. از صرافی: آدرس، مبلغ و کامنت را کپی کنید.<br>"
+                   "بعد از پرداخت، اشتراک <b>خودکار</b> فعال می‌شود.", None)
+             .details("راهنما", "<ul><li>اگر صرافی کامنت نمی‌گیرد، فقط <b>دقیقاً همین مبلغ</b> را بفرستید (تا "
+                      f"{R.tm(inv['expires'], 't')}).</li><li>کمتر فرستادید؟ باقی را با همان کامنت بفرستید.</li>"
+                      f"<li>فقط {lt('TON')} روی شبکهٔ {lt('TON')}.</li></ul>"))
         mk = kb([btn("باز کردن در کیف‌پول", url=links["tonkeeper"], style="success", icon="coin")],
-                [btn("کپی آدرس", copy=a, icon="link"), btn("کپی مبلغ", copy=amt, icon="usd"),
-                 btn("کپی کامنت", copy=inv["memo"], icon="edit")],
-                [btn("پرداخت کردم — بررسی", f"tonchk:{inv['id']}", style="primary", icon="refresh")])
+                [btn("آدرس", copy=a, icon="link"), btn("مبلغ", copy=amt, icon="usd"), btn("کامنت", copy=inv["memo"], icon="edit")],
+                [btn("بررسی پرداخت", f"tonchk:{inv['id']}", style="primary", icon="refresh")])
         return d, mk, links
 
     async def ton_pay(self, u: Update, c):
@@ -338,11 +327,7 @@ class Service:
         except RuntimeError as ex:
             log.error("TON invoice failed: %s", ex)
             return await self.say(q.message, Doc().p(f"{e('warn')} ساخت فاکتور ممکن نشد؛ چند دقیقهٔ دیگر دوباره امتحان کنید."))
-        d, mk, links = self.ton_invoice_doc(inv, await self.ton.api.usd_rate())
-        try:
-            await c.bot.send_photo(uid, TP.qr_png(links["ton"]), caption=f"QR — {TP.fmt_ton(inv['amount_nano'])} TON · {inv['memo']}")
-        except Exception as ex:  # noqa: BLE001 — QR is a convenience; the invoice text has everything
-            log.warning("QR send failed: %s", type(ex).__name__)
+        d, mk, _ = self.ton_invoice_doc(inv, await self.ton.api.usd_rate())
         await self.say(q.message, d, mk)
 
     async def ton_check(self, u: Update, c):
@@ -369,7 +354,9 @@ class Service:
         await self.alert(q, "هنوز پرداختی پیدا نشد. اگر الان فرستادید، تا تأیید شبکه صبر کنید؛ به‌محض دریافت خودکار خبر می‌دهیم.", True)
 
     def _ton_event(self, kind, data):
-        """Called by the gateway (inside the poll loop) after a transaction has been committed."""
+        """Called by the gateway (inside the poll loop) after a transaction has been committed / on API health changes."""
+        if kind in ("api_down", "api_up"):
+            return self._ton_admin(kind, data)
         inc = data["inc"]
         link = kb([btn("مشاهدهٔ تراکنش", url=TP.tx_url(inc["hash"]), icon="search")])
         if kind == "paid":
@@ -386,15 +373,61 @@ class Service:
                       ("کامنت", mono(data["memo"]))])
                  .note("باقی‌مانده را با <b>همان کامنت</b> بفرستید تا اشتراک فعال شود.", "info"))
             self.notify(data["uid"], d, markup=link)
-        if kind in ("paid", "partial", "unmatched"):
-            who = f"user {data['uid']} ({data.get('how')})" if data.get("uid") else "UNMATCHED"
-            self.notify_admins(f"💎 TON {kind}: {TP.fmt_ton(inc['value'])} TON — {who}\n"
-                               f"memo: {inc.get('memo') or '-'} | comment: {(inc.get('comment') or '-')[:80]}\n"
-                               f"tx: {inc['hash']}" + ("\n/tonassign <tx> <user_id>" if kind == "unmatched" else ""))
+        self._ton_admin(kind, data)
+
+    def _ton_admin(self, kind, data):
+        """Admin card for every gateway event (rich, with action buttons)."""
+        head = {"paid": ("party", "پرداخت TON — اشتراک فعال شد"), "partial": ("wait", "پرداخت TON — ناقص"),
+                "unmatched": ("siren", "پرداخت TON بدون فاکتور"), "api_down": ("warn", "TonAPI در دسترس نیست"),
+                "api_up": ("ok", "TonAPI دوباره وصل شد")}[kind]
+        d = Doc().h(head[1], head[0], 3)
+        rows = []
+        if kind in ("api_down", "api_up"):
+            d.kv([("از", R.when(data["since"])),
+                  ("خطا", lt(str(data.get("error"))[:120])) if kind == "api_down" else
+                  ("مدت قطعی", ltr(f"{data['secs'] / 60:.1f} min"))])
+            d.note("پرداخت‌ها گم نمی‌شوند؛ بعد از اتصال از همان نقطه بررسی می‌شوند." if kind == "api_down"
+                   else "پرداخت‌های دوران قطعی دوباره بررسی شدند.", "info")
+        else:
+            inc = data["inc"]
+            uid = data.get("uid")
+            usr = self.db.user(uid) if uid else None
+            who = ((f"{lt('@' + usr['username'])} · " if usr and usr["username"] else "") + mono(uid)) if uid else "نامشخص"
+            memo = mono(inc["memo"]) if inc.get("memo") else ("🔒 رمزنگاری‌شده" if inc.get("encrypted") else "—")
+            how = {"memo": "کامنت", "amount": "مبلغ یکتا"}.get(data.get("how"), "—")
+            d.kv([("مبلغ", f"<b>{ltr(TP.fmt_ton(inc['value']))}</b> {lt('TON')}"),
+                  ("کاربر", who),
+                  ("تطبیق با", how) if uid else None,
+                  ("کامنت", memo),
+                  ("متن کامنت", lt((inc.get("comment") or "")[:60])) if inc.get("comment") and not inc.get("memo") else None,
+                  ("اشتراک تا", R.when(data["until"])) if kind == "paid" else None,
+                  ("باقی‌مانده", f"{ltr(TP.fmt_ton(data['need']))} {lt('TON')}") if kind == "partial" else None,
+                  ("فرستنده", mono(TP.friendly_address(inc["source"]))) if inc.get("source") else None,
+                  ("زمان", R.when(inc["utime"]))])
+            if kind == "unmatched":
+                d.note(f"این واریز به هیچ فاکتوری نخورد و <b>اعمال نشد</b>. اگر صاحبش را می‌شناسید: "
+                       f"{mono('/tonassign ' + inc['hash'] + ' <user_id>')}", "warn")
+            rows.append([btn("تراکنش", url=TP.tx_url(inc["hash"]), icon="search"), btn("کپی tx", copy=inc["hash"], icon="link")])
+            if inc.get("source"):
+                rows.append([btn("فرستنده در Tonviewer", url=f"https://tonviewer.com/{TP.friendly_address(inc['source'])}", icon="search")])
+            # NOTE: no tg://user?id= URL button — live-tested: Telegram rejects the WHOLE message
+            # (Button_user_invalid) when it can't resolve the user, which would silently drop the alert.
+        self.notify_admins(d, kb(*rows) if rows else None)
+
+    def pay_rows(self, renew=False):
+        """Payment buttons — the SAME choice everywhere a subscription is offered (Stars + TON when enabled)."""
+        rows = [[btn(f"{'تمدید' if renew else 'پرداخت'} با Stars — {self.cfg.price_stars} ⭐", "buy", style="success", icon="pstar")]]
+        if self.ton.enabled():
+            rows.append([btn(f"{'تمدید' if renew else 'پرداخت'} با TON — {TP.fmt_ton(self.ton.price_nano())} TON", "tonpay",
+                             style="primary", icon="coin")])
+        return rows
 
     def need_sub(self, uid):
         return None if self.db.is_subscribed(uid) else \
-            Doc().p(f"{e('lock')} <b>برای این بخش اشتراک فعال لازم است.</b>").p("از دکمهٔ زیر یا «💳 اشتراک» اقدام کنید.")
+            Doc().p(f"{e('lock')} <b>برای این بخش اشتراک فعال لازم است.</b>").p("یکی از روش‌های پرداخت زیر را انتخاب کنید.")
+
+    async def paywall(self, target, m):
+        return await self.say(target, m, kb(*self.pay_rows()))
 
     # ------------------------------------------------------------------ wallets
     def wallets_view(self, uid):
@@ -441,7 +474,7 @@ class Service:
         q = u.callback_query
         await self.safe_answer(q)
         if (m := self.need_sub(q.from_user.id)):
-            return await self.say(q.message, m, kb([btn("خرید اشتراک", "buy", style="success", icon="pstar")]))
+            return await self.paywall(q.message, m)
         if len(self.db.wallets(q.from_user.id)) >= 5:
             return await self.alert(q, "حداکثر ۵ ولت مجاز است.", True)
         c.user_data["state"] = "await_pk"
@@ -638,7 +671,7 @@ class Service:
         uid = u.effective_user.id
         self.db.ensure_user(uid, u.effective_user.username)
         if (m := self.need_sub(uid)):
-            return await self.say(u, m, kb([btn(f"خرید اشتراک — {self.cfg.price_stars} ⭐", "buy", style="success", icon="pstar")]))
+            return await self.paywall(u, m)
         if not self.db.apikey(uid):
             return await self.say(u, Doc().p(f"{e('lock')} اول کلید {lt('API')} شخصی {lt('OpenSea')} را ثبت کنید."),
                                   kb([btn("افزودن کلید API", "kset", style="success", icon="plus")]))
@@ -999,7 +1032,7 @@ class Service:
                 return
             return await self.alert(q, "این برنامه قبلاً ثبت شده یا منقضی شده است.")
         if (m := self.need_sub(uid)):
-            return await self.say(q.message, m)
+            return await self.paywall(q.message, m)
         p["step"] = "arming"                                     # double taps hit the guard above
         sel = sorted((s for s in p["stages"] if s["qty"]), key=lambda s: s["start"])
         pref = self.db.prefs(uid)
@@ -1319,22 +1352,36 @@ class Service:
     TON_RECEIVED_SQL = "SELECT COALESCE(SUM(value_nano),0) FROM ton_payments WHERE kind IN ('paid','partial','manual')"
 
     async def tonstatus(self, u: Update, c):
+        """Admin dashboard: gateway health, price, today / 7 d / total revenue, open invoices, recent + unmatched payments."""
         if not self.is_admin(u):
             return
         q = lambda s_, a=(): self.db.q(s_, a)[0][0]
-        n_open = q("SELECT COUNT(*) FROM ton_invoices WHERE status='open'")
-        n_paid = q("SELECT COUNT(*) FROM ton_invoices WHERE status='paid'")
-        n_un = q("SELECT COUNT(*) FROM ton_payments WHERE kind='unmatched'")
-        got = TP.fmt_ton(q(self.TON_RECEIVED_SQL))
+        now = int(time.time())
+        rev = lambda since: TP.fmt_ton(q("SELECT COALESCE(SUM(value_nano),0) FROM ton_payments "
+                                          "WHERE kind IN ('paid','partial','manual') AND utime>=?", (since,)))
         price = self.ton.price_nano()
-        lines = [title("coin", "TON"),
-                 f"enabled {self.ton.enabled()} | api {self.ton.healthy}",
-                 f"address <code>{esc(self.ton.address or '-')}</code>",
-                 f"price {TP.fmt_ton(price) if price else '-'} TON | cursor lt {esc(self.db.setting('ton_last_lt'))}",
-                 f"invoices open {n_open} | paid {n_paid} | received {got} TON | unmatched {n_un}"]
-        for r in self.db.ton_unmatched(5):
-            lines.append(f"• <code>{r['tx_hash']}</code> {TP.fmt_ton(r['value_nano'])} TON {esc((r['comment'] or '')[:40])}")
-        await self.say(u, "\n".join(lines))
+        api = {True: f"{e('green')} وصل", False: f"{e('red')} قطع", None: f"{e('wait')} هنوز بررسی نشده"}[self.ton.healthy]
+        d = (Doc().h(f"داشبورد {lt('TON')}", "chart", 2)
+             .kv([("وضعیت", f"{e('green')} فعال" if self.ton.enabled() else f"{e('red')} غیرفعال"),
+                  ("TonAPI", api), ("قیمت", f"{ltr(TP.fmt_ton(price))} {lt('TON')}" if price else "تنظیم نشده"),
+                  ("آدرس", mono(self.ton.address or "-"))])
+             .table(["امروز", "۷ روز", "کل"], [[ltr(rev(now - 86400)), ltr(rev(now - 7 * 86400)), ltr(TP.fmt_ton(q(self.TON_RECEIVED_SQL)))]],
+                    caption=f"درآمد ({lt('TON')})")
+             .kv([("فاکتور باز", ltr(q("SELECT COUNT(*) FROM ton_invoices WHERE status='open' AND expires>?", (now,)))),
+                  ("فاکتور پرداخت‌شده", ltr(q("SELECT COUNT(*) FROM ton_invoices WHERE status='paid'"))),
+                  ("بدون فاکتور", ltr(q("SELECT COUNT(*) FROM ton_payments WHERE kind='unmatched'")))]))
+        recent = self.db.q("SELECT * FROM ton_payments WHERE kind IN ('paid','partial','manual','unmatched') ORDER BY lt DESC LIMIT 8")
+        if recent:
+            k = {"paid": e("ok"), "partial": e("wait"), "manual": e("edit"), "unmatched": e("siren")}
+            d.table(["نوع", "مبلغ", "کاربر", "زمان"],
+                    [[k[r["kind"]], ltr(TP.fmt_ton(r["value_nano"])), mono(r["user_id"]) if r["user_id"] else "—",
+                      R.tm(r["utime"], "d")] for r in recent], caption="آخرین واریزها")
+        un = self.db.ton_unmatched(5)
+        if un:
+            d.details(f"{e('siren')} واریزهای بدون فاکتور",
+                      "<ul>" + "".join(f"<li>{ltr(TP.fmt_ton(r['value_nano']) + ' TON')} — {mono(r['tx_hash'])}</li>" for r in un) + "</ul>"
+                      + f"<p>{mono('/tonassign <tx> <user_id>')}</p>", open_=True)
+        await self.say(u, d)
 
     async def stats(self, u: Update, c):
         if not self.is_admin(u):
