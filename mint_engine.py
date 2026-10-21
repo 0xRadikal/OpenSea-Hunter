@@ -61,6 +61,8 @@ QUANTITY = 1                        # tokens per tx (may only be LOWERED at runt
 MIN_UNIT = None                     # price policy: accepted unit price range [MIN_UNIT, MAX_UNIT] (wei per token);
 MAX_UNIT = None                     # None -> exact EXPECTED_PRICE (legacy). Set by the wrapper from the user policy.
 TIMING = {}                         # speed report (epoch seconds), filled by main()
+WALLET_CAP_FN = None                # fn(stage_label) -> absolute max_total_mintable_by_wallet OpenSea will sign for
+                                    # THIS wallet in THIS stage (from /eligibility), or None if unknown. Set by wrapper.
 NONCE_FILE = None                   # per-wallet nonce coordination file (service sets it)
 API_MAX_QTY = 100                   # OpenSea /mint accepts quantity 1..100 (docs)
 # Priority fee: set equal to maxFee at runtime. Measured on this chain (355 SeaDrop txs of the Thousand
@@ -303,10 +305,11 @@ def mint_stats(me):
 
 
 def clamp_quantity(want, limit, done, total, max_supply, bal, price, reserve=100_000_000_000_000):
-    """-> (qty, reason). Largest qty <= want the wallet may still mint now. limit/done/total/max_supply may be
-    None (unknown -> not used). Per-wallet limit is cumulative over ALL stages (SeaDrop _checkMintQuantity)."""
+    """-> (qty, reason). Largest qty <= want the wallet may still mint now. `limit` is the ABSOLUTE
+    maxTotalMintableByWallet the stage will be signed/checked with (SeaDrop compares numMinted + qty against it);
+    limit/done/total/max_supply may be None (unknown -> not used)."""
     q, why = min(int(want), API_MAX_QTY), None
-    if limit and done is not None:
+    if limit is not None and done is not None:
         if limit - done < q:
             q, why = limit - done, "wallet_limit"
     if max_supply and total is not None and max_supply - total < q:
@@ -584,12 +587,6 @@ def main():
     if nft_balance(me) >= TARGET_HELD:
         log("wallet already holds the target amount — nothing to do"); return
 
-    if MINT_KIND == "public":
-        p_, _s, _e, limit = onchain_public_drop()
-        done = minted_count_onchain(me)
-        if limit and done >= 0 and done >= limit:
-            RESULT["reason"] = "wallet_limit"
-            log(f"wallet already minted {done}/{limit} (on-chain per-wallet limit) — nothing to do"); return
     T0, T_END = (a.start, a.start + 3600) if a.start else (STAGE_START, STAGE_END)
     api_limit = None
     if not a.no_api_check:
@@ -622,16 +619,26 @@ def main():
     SIBLING["since"] = time.time()                       # sibling txs after this moment invalidate the snapshot
     bal = int(rr("eth_getBalance", [me, "latest"]), 16)
     ms = mint_stats(me)
-    limit = api_limit
-    if MINT_KIND == "public":
+    # Per-wallet limits are PER STAGE on OpenSea drops (verified live 2026-10-21, nazism-doc): OpenSea signs
+    # maxTotalMintableByWallet = what this wallet may hold-minted in total incl. other stages (e.g. 4 minted in
+    # stage "x" + public limit 1 -> signed cap 5), and serves public stages as mintSigned when the on-chain
+    # public cap is already used. So the only reliable allowance is OpenSea's /eligibility cap for this wallet.
+    limit, cap_src = None, "unknown"
+    if WALLET_CAP_FN:
         try:
-            limit = onchain_public_drop()[3]                 # what the contract enforces for mintPublic
-        except Exception as e:
-            log(f"getPublicDrop failed ({str(e)[:60]}) — limit unknown, OpenSea/contract will enforce it")
+            box = {}
+            th = threading.Thread(target=lambda: box.setdefault("v", WALLET_CAP_FN(STAGE_LABEL)), daemon=True)
+            th.start(); th.join(25)
+            if box.get("v") is not None:
+                limit, cap_src = int(box["v"]), "OpenSea eligibility"
+        except Exception as e:  # noqa: BLE001
+            log(f"eligibility cap read failed ({str(e)[:60]})")
+    if limit is None:
+        log(f"per-wallet cap unknown (api stage limit {api_limit}) — not pre-clamping; OpenSea/contract enforce it")
     want = QUANTITY
     q, why = clamp_quantity(want, limit, ms[0] if ms else None, ms[1] if ms else None, ms[2] if ms else None,
                             bal, unit_range()[1])                # worst case the policy allows
-    log(f"quantity: wanted {want}, minted so far {ms[0] if ms else '?'} / limit {limit or '?'}, "
+    log(f"quantity: wanted {want}, minted so far {ms[0] if ms else '?'} / cap {limit if limit is not None else '?'} ({cap_src}), "
         f"supply {ms[1] if ms else '?'}/{ms[2] if ms else '?'} -> {q}" + (f" ({why})" if why and q < want else ""))
     if q < 1:
         RESULT["reason"] = why or "error"
@@ -739,12 +746,15 @@ def main():
                     state["last_err"] = "not currently active (other stage still active: " + named + ")"
                 if named == STAGE_LABEL and "limit" in msg.lower():
                     state["limit_hit"] = True
+                if code == 422 and "cannot mint any more" in msg.lower():   # live text 2026-10-21 (nazism-doc)
+                    state["no_more"] = state.get("no_more", 0) + 1
             log(f"{tag} API {code} in {ms:.0f} ms rem={rem}: {msg}")
 
     precise_sleep_until(T0)
     log(">>> T0")
     TIMING["t0"] = T0
     t_fire = time.time()
+    TIMING["fire"] = t_fire
     for i, (off, kidx) in enumerate(WAVE):
         if win.wait(max(0.0, t_fire + off - time.time())):     # wakes instantly on a win
             break
@@ -762,6 +772,11 @@ def main():
                 RESULT["reason"] = "wallet_limit"
                 log("*** wallet already holds the NFT (API: wallet limit reached) ***"); return
             state["limit_hit"] = False
+        if state.get("no_more", 0) >= 2:
+            # OpenSea: "This wallet cannot mint any more from this drop: it has reached its limit for the active
+            # stage, or the drop is minted out". Retrying cannot change it (only the creator can) -> stop, 0 gas.
+            RESULT["reason"] = "wallet_limit"
+            log("OpenSea: wallet reached its limit for the active stage (or sold out) — stopping, no tx sent"); return
         if state["not_on_list"] >= 3:
             if not state.get("warned"):
                 state["warned"] = True
@@ -802,7 +817,12 @@ def main():
         log("value/price policy mismatch — refusing"); return
     RESULT["unit_price"] = VALUE // QUANTITY
     if tx["data"][:10].lower() == SEL_PUBLIC:
-        p_, st_, en_ = onchain_public_price()
+        p_, st_, en_, pmpw = onchain_public_drop()
+        # mintPublic is checked on-chain against the PUBLIC drop's cumulative cap (numMinted + qty <= pmpw);
+        # if that is certain to fail, sending only burns gas on a revert.
+        if MINTED_BEFORE is not None and pmpw and MINTED_BEFORE + QUANTITY > pmpw:
+            RESULT["reason"] = "wallet_limit"
+            log(f"mintPublic: on-chain public maxTotalMintableByWallet {pmpw} < minted {MINTED_BEFORE} + {QUANTITY} — not sending"); return
         if p_ * QUANTITY != VALUE:
             # mintPublic calldata carries no price: the contract charges its CURRENT price. Follow it only if the
             # user's policy accepts it; otherwise nothing is sent (sending the old value would just revert).

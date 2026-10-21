@@ -14,6 +14,7 @@ class FakeOpenSea:
         self.mint_bodies = []    # every POST /mint body (minter, quantity)
         self.valid_keys = {"k" * 32}
         self.eligible = set()    # lower-case addresses eligible for every stage
+        self.caps = {}           # (slug, stage_uuid) -> int | fn(addr) : max_total_mintable_by_wallet (absolute)
         self.contracts = {}      # (chain, addr) -> slug
         self.nonces, self.sessions, self.pats, self.jwts = set(), {}, {}, {}
         outer = self
@@ -52,8 +53,15 @@ class FakeOpenSea:
                     if not addr:
                         return self._send(401, {"errors": ["auth"]})
                     d = outer.drops.get(p[3], {})
-                    return self._send(200, {"stages": [{"stage_uuid": s["uuid"], "is_eligible": addr in outer.eligible}
-                                                       for s in d.get("stages", [])]})
+                    out = []
+                    for s in d.get("stages", []):
+                        e = {"stage_uuid": s["uuid"], "is_eligible": addr in outer.eligible or s.get("stage_type") == "public_sale",
+                             "price": s.get("price"), "max_total_mintable_by_wallet_per_token": None}
+                        cf = outer.caps.get((p[3], s["uuid"]))
+                        e["max_total_mintable_by_wallet"] = (str(cf(addr)) if callable(cf) else str(cf)) if cf is not None \
+                            else s.get("max_per_wallet")
+                        out.append(e)
+                    return self._send(200, {"stages": out})
                 if p[:4] == ["api", "v2", "chain", "robinhood"] and len(p) == 6 and p[4] == "contract":
                     slug = outer.contracts.get(p[5].lower())
                     return self._send(200, {"collection": slug}) if slug else self._send(404, {"errors": ["nf"]})

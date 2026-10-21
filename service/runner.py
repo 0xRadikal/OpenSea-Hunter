@@ -85,6 +85,19 @@ def speed_text(sp):
     chain time (1 s resolution on Robinhood Chain); rank counts SeaDrop mint txs of this NFT since T0."""
     if not sp:
         return ""
+    if "late_start" in sp:
+        out = [f"\n⚡ سرعت ربات (تسک {sp['late_start']:.0f} ث بعد از شروع مرحله ثبت/اجرا شد؛ از لحظهٔ شلیک):"]
+        for k, lab in (("own_api_win", "امضا/calldata از OpenSea"), ("own_sent", "ارسال تراکنش (پذیرش sequencer)"),
+                       ("own_receipt", "تأیید روی زنجیره (رسید)")):
+            if k in sp:
+                out.append(f"  • {lab}: {sp[k]:+.3f} ث")
+        if "block" in sp:
+            out.append(f"  • بلاک {sp['block']} (ردیف {sp.get('tx_index', '?')})")
+        if "rank" in sp:
+            out.append(f"  • رتبه بین مینت‌های این کالکشن از شروع مرحله: #{sp['rank']} (به‌خاطر ثبت دیر، معیار رقابت نیست)")
+        if "unit_price" in sp:
+            out.append(f"  • قیمت پرداختی هر عدد: {sp['unit_price'] / 1e18:.6f} ETH")
+        return "\n".join(out)
     out = ["\n⚡ سرعت (از لحظهٔ شروع مرحله):"]
     if "api_win" in sp:
         out.append(f"  • امضا/calldata از OpenSea: {sp['api_win']:+.3f} ث")
@@ -170,6 +183,8 @@ class Runner:
                "--label", t["stage_label"], "--start", str(t["start_ts"]), "--end", str(t["end_ts"]),
                "--kind", t["kind"], "--price-wei", str(t["price_wei"]), "--max-value-wei", str(t["max_value_wei"]),
                "--quantity", str(t["quantity"]), "--nonce-file", self.nonce_path(t["wallet_id"])]
+        if t["stage_uuid"]:
+            cmd += ["--stage-uuid", t["stage_uuid"]]
         if t["min_unit_wei"] is not None:
             cmd += ["--min-unit-wei", str(t["min_unit_wei"])]
         if t["max_unit_wei"] is not None:

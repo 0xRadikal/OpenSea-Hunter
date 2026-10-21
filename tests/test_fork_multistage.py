@@ -16,13 +16,15 @@ def env():
     fo.close(); fu.stop_fork()
 
 
-def run(fo, pk, slug, kind, price, qty, start, label="S", nonce_file=None, end=None, cap=None):
+def run(fo, pk, slug, kind, price, qty, start, label="S", nonce_file=None, end=None, cap=None, uuid=None):
     cmd = [sys.executable, os.path.join(fu.ROOT, "service", "engine_wrapper.py"), "--task-id", "31", "--slug", slug,
            "--nft", fu.NFT, "--label", label, "--start", str(int(start)), "--end", str(int(end or start + 3600)),
            "--kind", kind, "--price-wei", str(price), "--max-value-wei", str(price * qty if cap is None else cap),
            "--quantity", str(qty), "--api-base", fo.url, "--rpc", fu.F, "--no-api-check"]
     if nonce_file:
         cmd += ["--nonce-file", nonce_file]
+    if uuid:
+        cmd += ["--stage-uuid", uuid]
     p = subprocess.run(cmd, input=json.dumps({"pk": pk, "api_key": "k" * 32}) + "\n", capture_output=True, text=True, timeout=150)
     res = [l for l in p.stdout.splitlines() if l.startswith("OSH_RESULT ")]
     return p.stdout + p.stderr, (json.loads(res[-1][11:]) if res else None)
@@ -47,21 +49,40 @@ def test_public_paid_quantity_3_exact_value(env):
 
 
 def test_cumulative_limit_clamps_quantity(env):
-    """limit 3, wallet already minted 2 (earlier stage) -> user wanted 3, engine asks/sends 1, value = 1 x price."""
+    """Public stage cap 3 (OpenSea eligibility = on-chain public cap 3), wallet already minted 2 -> wanted 3,
+    engine asks/sends 1, value = 1 x price; then full -> zero tx."""
     _, fo = env
     now = int(time.time()); fu.set_public_drop(P, now - 60, now + 3600, max_per_wallet=3)
     a, pk = fu.funded_wallet(10 ** 16)
+    fo.drops["cl"] = {"collection_slug": "cl", "chain": "robinhood", "contract_address": fu.NFT,
+                      "stages": [{"uuid": "u-cl", "label": "S", "stage_type": "public_sale", "price": str(P), "max_per_wallet": "3"}]}
+    fo.caps[("cl", "u-cl")] = 3
     fo.mint["cl"] = lambda m, q: (200, {"to": fu.SD, "data": fu.public_calldata(m, q), "value": str(P * q), "chain": "robinhood"})
-    out, res = run(fo, pk, "cl", "public", P, 2, time.time() + 4)
+    out, res = run(fo, pk, "cl", "public", P, 2, time.time() + 4, uuid="u-cl")
     assert res["minted"] and len(res["token_ids"]) == 2, out[-1500:]
     n0 = len(fo.mint_bodies); b0 = fu.eth(a.address)
-    out, res = run(fo, pk, "cl", "public", P, 3, time.time() + 4)
+    out, res = run(fo, pk, "cl", "public", P, 3, time.time() + 4, uuid="u-cl")
     assert res["minted"] and res["token_ids"] and len(res["token_ids"]) == 1 and res["wanted"] == 3 and res["quantity"] == 1, out[-1500:]
     assert "wallet_limit" in out and fo.mint_bodies[n0]["quantity"] == 1
     assert P <= b0 - fu.eth(a.address) < P + 10 ** 14 and mints(a.address) == 3
     nn = fu.nonce(a.address)
-    out, res = run(fo, pk, "cl", "public", P, 1, time.time() + 4)               # now full: zero tx
+    out, res = run(fo, pk, "cl", "public", P, 1, time.time() + 4, uuid="u-cl")   # now full: zero tx
     assert res["minted"] is False and res["reason"] == "wallet_limit" and fu.nonce(a.address) == nn
+
+
+def test_mintpublic_over_onchain_cap_without_eligibility_sends_nothing(env):
+    """No eligibility cap known, OpenSea returns mintPublic qty 3 but on-chain public cap 3 with 2 minted:
+    it would surely revert -> refused before signing (0 tx, 0 gas)."""
+    _, fo = env
+    now = int(time.time()); fu.set_public_drop(P, now - 60, now + 3600, max_per_wallet=3)
+    a, pk = fu.funded_wallet(10 ** 16)
+    fo.mint["cn"] = lambda m, q: (200, {"to": fu.SD, "data": fu.public_calldata(m, q), "value": str(P * q), "chain": "robinhood"})
+    out, res = run(fo, pk, "cn", "public", P, 2, time.time() + 4)
+    assert res["minted"] and len(res["token_ids"]) == 2, out[-1500:]
+    nn = fu.nonce(a.address)
+    out, res = run(fo, pk, "cn", "public", P, 3, time.time() + 4)
+    assert res["minted"] is False and res["reason"] == "wallet_limit" and fu.nonce(a.address) == nn, out[-1500:]
+    assert "on-chain public maxTotalMintableByWallet 3 < minted 2 + 3" in out
 
 
 def test_signed_free_quantity_5(env):

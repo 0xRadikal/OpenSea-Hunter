@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   tx_hash TEXT, result TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
   kind TEXT NOT NULL DEFAULT 'signed', price_wei TEXT NOT NULL DEFAULT '0', max_value_wei TEXT NOT NULL DEFAULT '0',
   quantity INTEGER NOT NULL DEFAULT 1, plan_id TEXT, apikey_id INTEGER,
-  min_unit_wei TEXT, max_unit_wei TEXT, price_policy TEXT NOT NULL DEFAULT 'exact');
+  min_unit_wei TEXT, max_unit_wei TEXT, price_policy TEXT NOT NULL DEFAULT 'exact', stage_uuid TEXT);
 CREATE TABLE IF NOT EXISTS apikeys2(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), blob BLOB NOT NULL,
   expires_at INTEGER, source TEXT NOT NULL, created INTEGER NOT NULL, label TEXT, fp TEXT NOT NULL,
@@ -52,7 +52,8 @@ class DB:
         for col, ddl in (("kind", "TEXT NOT NULL DEFAULT 'signed'"), ("price_wei", "TEXT NOT NULL DEFAULT '0'"),
                          ("max_value_wei", "TEXT NOT NULL DEFAULT '0'"), ("quantity", "INTEGER NOT NULL DEFAULT 1"),
                          ("plan_id", "TEXT"), ("apikey_id", "INTEGER"), ("min_unit_wei", "TEXT"),
-                         ("max_unit_wei", "TEXT"), ("price_policy", "TEXT NOT NULL DEFAULT 'exact'")):
+                         ("max_unit_wei", "TEXT"), ("price_policy", "TEXT NOT NULL DEFAULT 'exact'"),
+                         ("stage_uuid", "TEXT")):
             if col not in cols:                     # migrate DBs created before paid/public support
                 self.c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
 
@@ -231,7 +232,7 @@ class DB:
 
     # tasks
     def add_task(self, uid, wid, slug, nft, label, start, end, kind="signed", price_wei=0, max_value_wei=None,
-                 quantity=1, plan_id=None, apikey_id=None, min_unit=None, max_unit=None, policy="exact"):
+                 quantity=1, plan_id=None, apikey_id=None, min_unit=None, max_unit=None, policy="exact", stage_uuid=None):
         quantity = int(quantity)
         lo = int(price_wei) if min_unit is None else int(min_unit)
         hi = int(price_wei) if max_unit is None else int(max_unit)
@@ -242,11 +243,11 @@ class DB:
             raise ValueError("bad mint policy")
         now = int(time.time())
         return self.x("INSERT INTO tasks(user_id,wallet_id,slug,nft,stage_label,start_ts,end_ts,status,created,updated,"
-                      "kind,price_wei,max_value_wei,quantity,plan_id,apikey_id,min_unit_wei,max_unit_wei,price_policy) "
-                      "VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?,?,?,?,?,?,?)",
+                      "kind,price_wei,max_value_wei,quantity,plan_id,apikey_id,min_unit_wei,max_unit_wei,price_policy,stage_uuid) "
+                      "VALUES(?,?,?,?,?,?,?,'scheduled',?,?,?,?,?,?,?,?,?,?,?,?)",
                       (uid, wid, slug, nft.lower(), label, start, end, now, now, kind, str(int(price_wei)),
                        str(int(max_value_wei)), quantity, plan_id, apikey_id,
-                       None if min_unit is None else str(lo), None if max_unit is None else str(hi), policy))
+                       None if min_unit is None else str(lo), None if max_unit is None else str(hi), policy, stage_uuid))
 
     def add_plan(self, uid, wid, slug, nft, items, max_active, plan_id):
         """Atomically insert one task per stage of a plan. items: [{label,start,end,kind,price_wei,quantity}].
@@ -267,7 +268,8 @@ class DB:
                     hi = it.get("max_unit", it["price_wei"])
                     ids.append(self.add_task(uid, wid, slug, nft, it["label"], it["start"], it["end"], it["kind"],
                                              it["price_wei"], int(hi) * int(it["quantity"]), it["quantity"], plan_id,
-                                             kid, it.get("min_unit"), it.get("max_unit"), it.get("policy", "exact")))
+                                             kid, it.get("min_unit"), it.get("max_unit"), it.get("policy", "exact"),
+                                             it.get("uuid")))
                 self.c.execute("COMMIT")
                 return ids
             except Exception:

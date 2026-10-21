@@ -125,7 +125,7 @@ class Service:
             "• دراپ‌های SeaDrop روی Robinhood Chain: مراحل امضادار (Allowlist) و عمومی (Public)، رایگان یا پولی.\n"
             "• یک لینک ← یک ولت ← چند مرحله با تعداد دلخواه برای هرکدام. ربات allowlist و سقف هر ولت را برای "
             "هر مرحله چک می‌کند (ورود SIWE به OpenSea) و در لحظهٔ شروع هر مرحله شلیک می‌کند.\n"
-            "• سقف هر ولت در SeaDrop تجمعی است؛ ربات هرگز بیشتر از سقف، عرضه یا قیمت قابل‌قبول ارسال نمی‌کند.\n"
+            "• سقف هر ولت (Limit N per wallet) جدا برای هر مرحله است و ربات آن را از OpenSea می‌خواند؛ ربات هرگز بیشتر از سقف، عرضه یا قیمت قابل‌قبول ارسال نمی‌کند.\n"
             "• ⚙️ تنظیمات: واکنش به تغییر قیمت (فقط همان قیمت / کمتر شد مینت کن / تا سقف ٪ / هر تغییری تا سقف ٪).\n"
             "• 🔑 چند کلید API: هر مرحلهٔ هم‌زمان کلید اختصاصی خودش را می‌گیرد.\n"
             "• بعد از هر مینت سرعت (از لحظهٔ شروع تا امضا، ارسال و تأیید) و رتبهٔ شما بین مینت‌کننده‌ها گزارش می‌شود.\n"
@@ -152,7 +152,7 @@ class Service:
 
     async def buy(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         uid = q.from_user.id
         await c.bot.send_invoice(uid, title=f"اشتراک {self.cfg.sub_days} روزه", description="اشتراک ربات مینت OpenSea-Hunter",
                                  payload=f"sub:{self.cfg.sub_days}:{uid}", currency="XTR", provider_token="",
@@ -190,7 +190,7 @@ class Service:
 
     async def wallet_add(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         if (m := self.need_sub(q.from_user.id)):
             return await q.message.reply_text(m)
         if len(self.db.wallets(q.from_user.id)) >= 5:
@@ -203,7 +203,7 @@ class Service:
 
     async def wallet_del(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         wid = int(q.data.split(":")[1])
         ok = self.db.delete_wallet(q.from_user.id, wid)
         self.db.audit(q.from_user.id, "wallet_delete", f"{wid} {ok}")
@@ -263,7 +263,7 @@ class Service:
 
     async def key_del(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         kid = int(q.data.split(":")[1])
         ok = self.db.delete_apikey(q.from_user.id, kid)
         self.db.audit(q.from_user.id, "apikey_delete", f"{kid} {ok}")
@@ -271,7 +271,7 @@ class Service:
 
     async def key_set(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         c.user_data["state"] = "await_key"
         await q.message.reply_text("کلید API (یا کل خروجی JSON دستور curl) را بفرستید. /cancel برای انصراف")
 
@@ -412,18 +412,20 @@ class Service:
         return "رایگان" if p == 0 else (f"{p / 1e18:.6f} ETH" if p else "?")
 
     async def plan_wallet(self, u: Update, c):
-        """Per-stage pre-check for the chosen wallet: eligibility (SIWE), per-wallet limit, already minted, funds."""
+        """Per-stage pre-check for the chosen wallet: OpenSea eligibility (SIWE) incl. the per-stage wallet cap,
+        already minted, funds. Per-wallet limits are PER STAGE (verified live 2026-10-21, nazism-doc): OpenSea's
+        /eligibility returns max_total_mintable_by_wallet = the absolute total this wallet may reach in that stage
+        (minted elsewhere + that stage's limit), and SeaDrop checks numMinted + qty <= it."""
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         uid = q.from_user.id
         p = c.user_data.get("plan")
         w = self.db.wallet(uid, int(q.data.split(":")[1]))
         if not (p and w):
             return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
         nft, slug = p["nft"], p["slug"]
-        signed_any = any(s["kind"] == "signed" for s in p["stages"])
-        m = await q.message.reply_text("⏳ پیش‌بررسی ولت: موجودی، تعداد مینت قبلی، سقف هر مرحله"
-                                       + (", ورود به OpenSea با ولت و چک allowlist…" if signed_any else "…"))
+        m = await q.message.reply_text("⏳ پیش‌بررسی ولت: موجودی، مینت‌های قبلی، ورود به OpenSea با ولت و چک allowlist "
+                                       "و سقف هر مرحله…")
         try:
             bal = await self.blocking(pf.check_wallet, w["address"])
             done = await self.blocking(pf.minted_count, nft, w["address"])
@@ -436,28 +438,33 @@ class Service:
             except pf.PreflightError:
                 pub = None
         el, el_err = {}, None
-        if signed_any:
-            try:
-                pk = self.vault.decrypt(uid, w["address"], w["blob"])
-                jwt = await self.blocking(self.os.wallet_jwt, pk)
-                del pk
-                el = await self.blocking(self.os.eligibility, slug, self.user_key(uid), jwt)
-            except (OpenSeaError, VaultError) as ex:
-                el_err = str(ex)[:80]
+        try:
+            pk = self.vault.decrypt(uid, w["address"], w["blob"])
+            jwt = await self.blocking(self.os.wallet_jwt, pk)
+            del pk
+            el = await self.blocking(self.os.eligibility_full, slug, self.user_key(uid), jwt)
+        except (OpenSeaError, VaultError) as ex:
+            el_err = str(ex)[:80]
         for s in p["stages"]:
-            s["limit"] = pf.stage_wallet_limit(s)
+            s["limit"] = pf.stage_wallet_limit(s)                    # per-stage limit as shown by OpenSea
             s["note"] = None
-            if s["kind"] == "public" and pub:
-                s["limit"] = pub[3]                                 # the contract enforces the on-chain value
-                if s["price_wei"] > 0 and pub[0] != s["price_wei"]:
-                    s["note"] = f"قیمت روی زنجیره ({pub[0] / 1e18:.6f}) با OpenSea فرق دارد"
-            s["eligible"] = True if s["kind"] == "public" else el.get(s["uuid"])     # public stages have no allowlist
-            room = (s["limit"] - done) if s["limit"] else pf.API_MAX_QTY
+            if s["kind"] == "public" and pub and s["price_wei"] > 0 and pub[0] != s["price_wei"]:
+                s["note"] = f"قیمت روی زنجیره ({pub[0] / 1e18:.6f}) با OpenSea فرق دارد"
+            e = el.get(s["uuid"]) or {}
+            s["eligible"] = e.get("eligible") if e else (True if s["kind"] == "public" else None)
+            s["cap"] = e.get("cap")                                  # absolute cap for THIS wallet in THIS stage
+            if s["cap"] is not None:
+                room = s["cap"] - done
+            elif s["limit"]:
+                room = s["limit"]                                    # unknown cap: assume the stage limit (per stage)
+            else:
+                room = pf.API_MAX_QTY
+            s["room"] = room
             fund = ((bal - pf.WARN_BALANCE_WEI // 4) // s["price_wei"]) if s["price_wei"] > 0 else pf.API_MAX_QTY
             s["maxq"] = max(0, min(pf.API_MAX_QTY, room, fund))
             s["why_no"] = ("طبق OpenSea این ولت در allowlist این مرحله نیست" if s["eligible"] is False else
                            s["note"] if s["note"] else
-                           f"سقف ولت پر است ({done} از {s['limit']})" if s["limit"] and room <= 0 else
+                           f"سقف این مرحله برای این ولت پر است (Limit {s['limit']} per wallet)" if room <= 0 else
                            "موجودی برای حتی ۱ عدد کافی نیست" if s["maxq"] < 1 else None)
             s["qty"] = None
         p.update(step="select", wid=w["id"], addr=w["address"], bal=bal, done=done, el_err=el_err)
@@ -476,7 +483,8 @@ class Service:
                          + (f"\n   🎯 انتخاب شما: <b>{s['qty']} عدد</b>" if s["qty"] else ""))
         if p.get("el_err"):
             lines.append(f"\n⚠️ چک allowlist ممکن نشد ({esc(p['el_err'])}); در زمان مینت دوباره چک می‌شود.")
-        lines.append("\nℹ️ سقف هر ولت در SeaDrop <b>تجمعی</b> است: مینت‌های مراحل قبل از سقف مراحل بعد کم می‌شود.")
+        lines.append("\nℹ️ سقف هر ولت <b>جدا برای هر مرحله</b> است (طبق OpenSea): مثلاً Limit 4 در مرحلهٔ اول و Limit 1 در "
+                     "مرحلهٔ دوم یعنی جمعاً ۵ عدد.")
         lines.append("مرحله(ها) را انتخاب و تعداد هرکدام را مشخص کنید، بعد «➡️ ادامه».")
         return "\n".join(lines)
 
@@ -497,9 +505,17 @@ class Service:
     def qty_options(maxq):
         return [n for n in (1, 2, 3, 5, 10, 20, 50) if n < maxq]
 
+    async def safe_answer(self, q, *a, **k):
+        """answerCallbackQuery is cosmetic (removes the spinner). A Telegram timeout there (seen live 2026-10-21:
+        httpx.ReadTimeout in answer_callback_query) must NOT abort the handler."""
+        try:
+            await q.answer(*a, **k)
+        except Exception as e:  # noqa: BLE001
+            log.warning("answerCallbackQuery failed (ignored): %s", type(e).__name__)
+
     async def plan_stage(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         p = c.user_data.get("plan")
         try:
             i = int(q.data.split(":")[1]); s = p["stages"][i]
@@ -519,12 +535,12 @@ class Service:
         cost = "" if not s["price_wei"] else f"\nقیمت هر عدد: {s['price_wei'] / 1e18:.6f} ETH"
         await q.message.edit_text(
             f"🎯 <b>{esc(s['label'])}</b>\nLimit {lim if lim else '?'} per wallet — سقف هر ولت این مرحله {lim if lim else 'نامشخص'} عدد است"
-            f" (شما قبلاً {p['done']} عدد مینت کرده‌اید).\nحداکثر قابل مینت برای شما: <b>{s['maxq']}</b>{cost}\n\n"
+            f".\nحداکثر قابل مینت برای شما در این مرحله: <b>{s['maxq']}</b>{cost}\n\n"
             "می‌خواهید در این مرحله چند عدد مینت کنید؟", parse_mode=ParseMode.HTML, reply_markup=IM(kb))
 
     async def plan_qty(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         p = c.user_data.get("plan")
         try:
             _, i, v = q.data.split(":"); i = int(i); s = p["stages"][i]
@@ -556,7 +572,7 @@ class Service:
 
     async def plan_back(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         p = c.user_data.get("plan")
         if not p or "wid" not in p:
             return await q.message.reply_text("جلسه منقضی شد؛ دوباره «🎯 تسک جدید» را بزنید.")
@@ -565,17 +581,13 @@ class Service:
 
     @staticmethod
     def project(p):
-        """Expected outcome if every earlier stage mints in full (cumulative per-wallet limit, start order)."""
-        run, out = p["done"], []
-        for s in sorted((s for s in p["stages"] if s["qty"]), key=lambda s: s["start"]):
-            allowed = (s["limit"] - run) if s["limit"] else s["qty"]
-            eff = max(0, min(s["qty"], allowed))
-            out.append((s, eff)); run += eff
-        return out
+        """Selected stages in start order. Limits are per stage (OpenSea signs a per-stage absolute cap that already
+        accounts for mints in other stages), so one stage's mints do not reduce another stage's allowance."""
+        return [(s, s["qty"]) for s in sorted((s for s in p["stages"] if s["qty"]), key=lambda s: s["start"])]
 
     async def plan_next(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         uid = q.from_user.id
         p = c.user_data.get("plan")
         if not p or p.get("step") != "select" or not any(s["qty"] for s in p["stages"]):
@@ -594,9 +606,6 @@ class Service:
                          f"   تعداد: <b>{qt}</b> — {cost}")
             if s["max_unit"] != pr or s["min_unit"] != pr:
                 lines.append(f"   قیمت قابل‌قبول هر عدد: {s['min_unit'] / 1e18:.6f} تا {s['max_unit'] / 1e18:.6f} ETH")
-            if eff < s["qty"]:
-                lines.append(f"   ⚠️ اگر مراحل قبلی کامل مینت شوند، به‌خاطر سقف تجمعی ({s['limit']}) در این مرحله فقط "
-                             f"{eff} عدد ممکن است. ربات لحظهٔ شلیک دوباره از روی زنجیره حساب می‌کند و هرگز بیشتر از سقف نمی‌فرستد.")
         lines.append(f"\n💰 جمع قیمت (حداکثر): {total / 1e18:.6f} ETH + گس (~{gas / 1e18:.4f}) | موجودی: {p['bal'] / 1e18:.6f} ETH")
         if p["bal"] < total + gas:
             lines.append("⚠️ موجودی برای همهٔ برنامه کافی نیست؛ ربات در هر مرحله فقط به اندازهٔ موجودی همان لحظه مینت می‌کند.")
@@ -631,7 +640,7 @@ class Service:
 
     async def plan_arm(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         uid = q.from_user.id
         p = c.user_data.get("plan")
         if not p or p.get("step") != "summary":
@@ -645,7 +654,7 @@ class Service:
         for s in sel:
             lo, hi = self.unit_bounds(s["price_wei"], pref["price_policy"], pref["max_increase_pct"])
             items.append({"label": s["label"], "start": s["start"], "end": s["end"], "kind": s["kind"],
-                          "price_wei": s["price_wei"], "quantity": s["qty"], "policy": pref["price_policy"],
+                          "price_wei": s["price_wei"], "quantity": s["qty"], "policy": pref["price_policy"], "uuid": s["uuid"],
                           "min_unit": lo, "max_unit": hi})
         plan_id = os.urandom(6).hex()
         res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.max_active(), plan_id)
@@ -665,13 +674,13 @@ class Service:
 
     async def plan_cancel(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         c.user_data.pop("plan", None); c.user_data.pop("state", None)
         await q.message.reply_text("لغو شد.", reply_markup=self.menu())
 
     async def stale(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         await q.message.reply_text("این دکمه مربوط به نسخهٔ قبلی است؛ دوباره «🎯 تسک جدید» را بزنید.")
 
     # ------------------------------------------------------------------ settings
@@ -703,7 +712,7 @@ class Service:
 
     async def set_policy(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         uid = q.from_user.id
         pref = self.db.prefs(uid)
         if q.data.startswith("cpp:"):
@@ -749,7 +758,7 @@ class Service:
 
     async def task_cancel(self, u: Update, c):
         q = u.callback_query
-        await q.answer()
+        await self.safe_answer(q)
         ok = await self.blocking(self.runner.cancel, q.from_user.id, int(q.data.split(":")[1]))
         await q.message.reply_text("لغو شد." if ok else "قابل لغو نیست.")
 
@@ -829,7 +838,9 @@ class Service:
 
     # ------------------------------------------------------------------ wiring
     def build(self) -> Application:
-        b = ApplicationBuilder().token(self.cfg.bot_token).concurrent_updates(True)
+        # Telegram default read timeout is 5 s; a live ReadTimeout (2026-10-21) killed a handler -> more headroom
+        b = ApplicationBuilder().token(self.cfg.bot_token).concurrent_updates(True) \
+            .read_timeout(20).write_timeout(20).connect_timeout(10).pool_timeout(5)
         if self.cfg.telegram_base_url:
             b = b.base_url(self.cfg.telegram_base_url.rstrip("/") + "/bot").base_file_url(self.cfg.telegram_base_url.rstrip("/") + "/file/bot")
         b = b.post_init(self._post_init).post_shutdown(self._post_shutdown)

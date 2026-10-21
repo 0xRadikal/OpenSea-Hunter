@@ -125,7 +125,7 @@ def test_full_flow(world):
     sel = tg.wait_text(U, "مرحله(ها) را انتخاب", since=m, timeout=40)[1]
     assert "✅ allowlist هست" in sel["text"] and "Limit 1 per wallet" in sel["text"]
     m = tg.mark(); tg.callback(U, stage_btn(sel, "OG List")); qm = tg.wait_text(U, "چند عدد مینت کنید", since=m)[1]
-    assert "Limit 1 per wallet" in qm["text"] and "حداکثر قابل مینت برای شما: <b>1</b>" in qm["text"]
+    assert "Limit 1 per wallet" in qm["text"] and "حداکثر قابل مینت برای شما در این مرحله: <b>1</b>" in qm["text"]
     m = tg.mark(); tg.callback(U, btn_by(qm, "حداکثر")); sel = tg.wait_text(U, "انتخاب شما: <b>1 عدد</b>", since=m)[1]
     m = tg.mark(); tg.callback(U, "pn"); tg.wait_text(U, "خلاصهٔ برنامهٔ مینت", since=m)
     m = tg.mark(); tg.callback(U, "pa"); tg.callback(U, "pa"); tg.callback(U, "pa")          # triple tap
@@ -194,7 +194,7 @@ def test_full_flow(world):
     m = tg.mark(); tg.text(U, "2"); tg.wait_text(U, "ولت را از دکمه", since=m)                    # typed while choosing
     m = tg.mark(); tg.callback(U, wallet_btn(msg, c_.address))
     sel = tg.wait_text(U, "مرحله(ها) را انتخاب", since=m, timeout=40)[1]
-    assert "تجمعی" in sel["text"] and "Limit 10 per wallet" in sel["text"]
+    assert "جدا برای هر مرحله" in sel["text"] and "تجمعی" not in sel["text"] and "Limit 10 per wallet" in sel["text"]
     # Allowlist: custom amount 2 (Persian digits)
     m = tg.mark(); tg.callback(U, stage_btn(sel, "Allowlist")); qm = tg.wait_text(U, "چند عدد مینت کنید", since=m)[1]
     m = tg.mark(); tg.text(U, "hello"); tg.wait_text(U, "تعداد را با دکمه", since=m)
@@ -216,7 +216,8 @@ def test_full_flow(world):
     done2 = tg.wait_text(U, "مینت انجام شد — 2 عدد", timeout=150, since=m)[1]["text"]
     done3 = tg.wait_text(U, "مینت انجام شد — 3 عدد", timeout=150, since=m)[1]["text"]
     for d in (done2, done3):
-        assert "⚡ سرعت" in d and "ارسال تراکنش" in d and "رتبهٔ ما" in d, d
+        assert "⚡ سرعت" in d and "ارسال تراکنش" in d and ("رتبهٔ ما" in d or "معیار رقابت نیست" in d), d
+        assert "معیار رقابت نیست" in d           # stage started ~1 min before arming: reported as late, not a record
     assert "قیمت پرداختی هر عدد: 0.001000 ETH" in done3
     assert fu.holds(c_.address) == 5 and 3 * P <= b0 - fu.eth(c_.address) < 3 * P + 2 * 10 ** 14
     pts = sorted([t for t in svc.db.tasks(U) if t["slug"] == pslug], key=lambda t: t["id"])
@@ -229,15 +230,16 @@ def test_full_flow(world):
     assert {k for q_, k in used if q_ == 2} and {k for q_, k in used if q_ == 3}
     assert not ({k for q_, k in used if q_ == 2} & {k for q_, k in used if q_ == 3}), used   # really different keys
 
-    # ---- cumulative wallet limit: the wallet holds 5 now; with limit 5 everything is shown as full, nothing armable
+    # ---- per-stage wallet limit: the wallet minted 5; OpenSea eligibility caps this stage at 5 -> full, nothing armable
     fu.set_public_drop(P, now - 60, now + 3600, max_per_wallet=5)
+    fo.caps[(pslug, "s-p")] = 5
     fo.drops[pslug]["stages"] = [fo.drops[pslug]["stages"][1]]
     n_tasks = len(svc.db.tasks(U))
     m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
     m = tg.mark(); tg.text(U, pslug); msg = tg.wait_text(U, "با کدام ولت", since=m)[1]
     m = tg.mark(); tg.callback(U, wallet_btn(msg, c_.address))
     sel = tg.wait_text(U, "مرحله(ها) را انتخاب", since=m, timeout=40)[1]["text"]
-    assert "سقف ولت پر است (5 از 5)" in sel
+    assert "سقف این مرحله برای این ولت پر است (Limit 10 per wallet)" in sel, sel
     assert len(svc.db.tasks(U)) == n_tasks
 
     # ---- group chats are ignored entirely

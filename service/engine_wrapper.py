@@ -24,6 +24,19 @@ def load_engine():
     return m
 
 
+def make_cap_fn(pk, api_key, slug, stage_uuid, base):
+    """Per-wallet absolute cap for this stage from OpenSea /eligibility (SIWE login with the wallet; only a login
+    message is signed). Returns None on any failure -> engine does not pre-clamp."""
+    def cap(_label):
+        sys.path.insert(0, HERE)
+        from service.opensea import OpenSea
+        o = OpenSea(base, timeout=8)
+        jwt = o.wallet_jwt(pk, tries=2)
+        e = o.eligibility_full(slug, api_key, jwt).get(stage_uuid) or {}
+        return e.get("cap") if e.get("eligible") else None
+    return cap
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task-id", type=int, required=True)        # for /proc identification only
@@ -36,6 +49,7 @@ def main():
     ap.add_argument("--price-wei", type=int, required=True)      # price the user confirmed
     ap.add_argument("--max-value-wei", type=int, required=True)  # hard spend cap (whole tx)
     ap.add_argument("--quantity", type=int, default=1)           # tokens wanted in this stage (may only shrink)
+    ap.add_argument("--stage-uuid")                              # OpenSea stage uuid -> per-wallet cap via /eligibility
     ap.add_argument("--min-unit-wei", type=int)                  # price policy: accepted unit price range
     ap.add_argument("--max-unit-wei", type=int)                  # (default = exactly --price-wei)
     ap.add_argument("--nonce-file")                              # per-wallet nonce lock shared by sibling tasks
@@ -67,6 +81,8 @@ def main():
     bot.MIN_UNIT, bot.MAX_UNIT = a.min_unit_wei, a.max_unit_wei
     if a.api_base:
         bot.API_BASE = a.api_base.rstrip("/") + "/api/v2/drops"
+    if a.stage_uuid:
+        bot.WALLET_CAP_FN = make_cap_fn(pk, api_key, a.slug, a.stage_uuid, a.api_base or "https://api.opensea.io")
     if a.rpc:
         bot.READ_RPCS = list(a.rpc)
 
@@ -103,6 +119,11 @@ def main():
         r["reason"] = "error" if err else "not_minted"
     t = dict(bot.TIMING)
     sp = {k: round(t[k] - t["t0"], 3) for k in ("api_win", "sent", "receipt") if t.get("t0") and t.get(k)}
+    if t.get("fire") and t.get("t0") and t["fire"] - t["t0"] > 2:
+        # stage was already open when we fired (task armed late): T0-relative numbers measure the user's delay,
+        # not our speed -> also report the engine's own reaction time from the moment it fired
+        sp["late_start"] = round(t["fire"] - t["t0"], 1)
+        sp.update({"own_" + k: round(t[k] - t["fire"], 3) for k in ("api_win", "sent", "receipt") if t.get(k)})
     for k in ("block", "block_ts", "tx_index", "rank"):
         if r.get(k) is not None:
             sp[k] = r[k]
