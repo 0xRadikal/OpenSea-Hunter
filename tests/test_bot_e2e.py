@@ -105,7 +105,11 @@ def test_full_flow(world):
     fo.mint[slug] = lambda m: (200, {"to": fu.SD, "data": cd, "value": "0", "chain": "robinhood"}) if m.lower() == a.address.lower() \
         else (422, {"errors": ["Wallet is not eligible for the active drop stage, 'OG List' (signed_presale): the wallet is not on this stage's allowlist."]})
 
-    m = tg.mark(); tg.text(U, "/start"); tg.wait_text(U, "سلام", since=m)
+    m = tg.mark(); tg.text(U, "/start"); st0 = tg.wait_text(U, "سلام", since=m)[1]; time.sleep(1.0)
+    outs = [c for c in tg.calls[m:] if c[0] in ("sendMessage", "sendRichMessage") and str(c[1].get("chat_id")) == str(U)]
+    assert len(outs) == 1, [o[1].get("text") for o in outs]                     # ONE welcome message, no sales follow-up
+    assert "اشتراک" not in st0["text"] and "buy" not in json.dumps(st0.get("reply_markup"))
+    assert st0["_rich"]["html"].startswith("<aside>") and "inline_keyboard" not in st0["reply_markup"]
     m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "اشتراک فعال لازم", since=m)        # gate
     m = tg.mark(); tg.callback(U, "wadd"); tg.wait_text(U, "اشتراک فعال لازم", since=m)          # gate
     subscribe(tg, U)

@@ -177,7 +177,7 @@ def speed_doc(d, sp):
     late_s = f"{sp['late_start']:.0f}" if late else ""
     cap = (f"⚡ سرعت ربات — از لحظهٔ شلیک (تسک {ltr(late_s)} ث بعد از شروع مرحله اجرا شد)" if late
            else "⚡ سرعت — از لحظهٔ شروع مرحله")
-    d.table(["گام", "زمان"], rows, caption=cap, align=["right", "left"])
+    d.table(["گام", "زمان"], rows, caption=cap)
     if late:
         d.note("تسک بعد از شروع مرحله ثبت شد؛ این گزارش سرعت خود ربات است، نه رقابت از لحظهٔ شروع.", "info")
     return d

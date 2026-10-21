@@ -175,31 +175,25 @@ class Service:
 
     # ------------------------------------------------------------------ basic
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """ONE short, centered message (pull quotes). No sales push: a subscription is offered only when the user
+        opens «💳 اشتراک» or uses a feature that needs one. The next onboarding step is a text hint in the same message."""
         usr = u.effective_user
         self.db.ensure_user(usr.id, usr.username)
         c.user_data.clear()
-        done, items = self.progress_card(usr.id)
         name = esc(usr.first_name or "دوست عزیز")
-        d = (Doc().h(f"سلام {name}، خوش آمدید", "robot", 2)
-             .p(f"<b>{lt('Ray Minter')}</b> دراپ‌های {lt('OpenSea')} روی شبکهٔ <b>{lt('Robinhood Chain')}</b> را "
-                "دقیقاً در لحظهٔ شروع، خودکار و با بیشترین سرعت برای ولت شما مینت می‌کند.")
-             .ul([f"{e('bolt')} <b>شلیک در همان ثانیهٔ شروع</b> هر مرحله ({lt('Allowlist')} و {lt('Public')})",
-                  f"{e('list')} <b>چند مرحله، تعداد دلخواه</b> برای هر مرحله، با یک ولت",
-                  f"{e('shield')} <b>امن:</b> کلید ولت رمزنگاری‌شده؛ هرگز بیشتر از سقف و قیمت تأییدشدهٔ شما خرج نمی‌شود",
-                  f"{e('chart')} <b>گزارش سرعت و رتبه</b> بعد از هر مینت"])
-             .hr().h(f"شروع کار — {ltr(f'{done}/3')}", "list", 3).checklist(items))
-        nxt = None
+        d = Doc().note(f"<b>سلام {name}، به {lt('Ray Minter')} خوش آمدید</b><br>"
+                       f"مینت خودکار دراپ‌های {lt('OpenSea')} روی {lt('Robinhood Chain')}<br>"
+                       "در همان ثانیهٔ شروع هر مرحله، سریع و امن", "robot", cite=lt("Ray Minter"))
         if not self.db.is_subscribed(usr.id):
-            nxt = btn(f"خرید اشتراک {self.cfg.sub_days} روزه — {self.cfg.price_stars} ⭐", "buy", style="success", icon="pstar")
+            step = "برای شروع، از منوی پایین بخش‌ها را ببینید"
         elif not self.db.wallets(usr.id):
-            nxt = btn("افزودن ولت", "wadd", style="success", icon="plus")
+            step = "قدم بعدی: افزودن ولت از «👛 ولت‌ها»"
         elif not self.db.apikeys(usr.id, valid_after=time.time()):
-            nxt = btn("افزودن کلید API", "kset", style="success", icon="plus")
+            step = f"قدم بعدی: افزودن کلید {lt('API')} از «🔑 کلید API»"
         else:
-            nxt = btn("تسک جدید", "nt", style="primary", icon="bolt")
-        d.footer(f"{lt('Ray Minter')} · {lt('Robinhood Chain')} · راهنما: /help")
+            step = "لینک کالکشن را بفرستید یا «🎯 تسک جدید» را بزنید"
+        d.note(f"{step}<br>راهنما: {lt('/help')}", "next")
         await self.say(u, d, self.menu())
-        await self.say(u, Doc().p(f"{e('next')} <b>قدم بعدی</b>"), kb([nxt]))
 
     async def help(self, u: Update, c):
         d = (Doc().h("راهنمای Ray Minter", "info", 2)
@@ -302,7 +296,7 @@ class Service:
             for n, w in enumerate(ws, 1):
                 busy = self.db.q("SELECT COUNT(*) FROM tasks WHERE wallet_id=? AND status IN ('scheduled','running')", (w["id"],))[0][0]
                 rows.append([ltr(n), mono(w["address"]), f"{e('bolt')} {ltr(busy)}" if busy else "—"])
-            d.table(["#", "آدرس", "تسک فعال"], rows, align=["center", "left", "center"])
+            d.table(["#", "آدرس", "تسک فعال"], rows)
         else:
             d.p(f"{e('info')} هنوز ولتی ثبت نکرده‌اید. با دکمهٔ «افزودن ولت» شروع کنید.")
         d.note(f"فقط <b>ولت جداگانه (burner)</b> با کمی {lt('ETH')} برای گس — <b>هرگز ولت اصلی</b>.", "shield")
@@ -407,8 +401,7 @@ class Service:
                 st = (f"{e('red')} منقضی" if dead else f"{e('warn')} رو به انقضا" if soon else f"{e('green')} معتبر")
                 exp = "—" if not k["expires_at"] else (R.tm(k["expires_at"], "d") if dead else R.rel(k["expires_at"]))
                 rows.append([lt(k["label"] or k["id"]), st, src.get(k["source"], esc(k["source"])), exp, ltr(busy) if busy else "—"])
-            d.table(["کلید", "وضعیت", "نوع", "انقضا", "تسک"], rows, caption=f"{ltr(valid)} معتبر از {ltr(len(ks))}",
-                    align=["center", "right", "right", "right", "center"])
+            d.table(["کلید", "وضعیت", "نوع", "انقضا", "تسک"], rows, caption=f"{ltr(valid)} معتبر از {ltr(len(ks))}")
         else:
             d.p(f"{e('red')} <b>هنوز کلیدی ثبت نشده</b> — برای مینت حداقل یک کلید لازم است.")
         d.details(f"{e('idea')} چرا چند کلید؟ و چطور کلید بسازم؟",
@@ -606,8 +599,7 @@ class Service:
         d = (Doc().h(lt(name), "gem", 2)
              .kv([("قرارداد", mono(nft)), ("شبکه", lt("Robinhood Chain")),
                   ("عرضه", f"{ltr(f'{tot:,} / {mx:,}')}  {ltr(ui.bar(tot, mx))}" if mx else lt(f"{drop.get('total_supply')}/{drop.get('max_supply')}"))])
-             .table(["مرحله", "نوع", "قیمت", "سقف ولت", "شروع"], rows, caption="مرحله‌ها",
-                    align=["right", "right", "center", "center", "right"]))
+             .table(["مرحله", "نوع", "قیمت", "سقف ولت", "شروع"], rows, caption="مرحله‌ها"))
         if notes:
             d.quote("\n".join(notes))
         if not ok_st:
@@ -713,8 +705,7 @@ class Service:
             rows.append([f"{mark} <b>{lt(s['label'])}</b><br>{R.tm(s['start'])}", elig,
                          lt(f"Limit {s['limit'] if s['limit'] else '?'}"), room,
                          f"<b>{ltr(s['qty'])}</b>" if s["qty"] else "—"])
-        d.table(["مرحله", lt("allowlist"), "سقف", "قابل مینت", "انتخاب"], rows,
-                align=["right", "center", "center", "right", "center"])
+        d.table(["مرحله", lt("allowlist"), "سقف", "قابل مینت", "انتخاب"], rows)
         if p.get("el_err"):
             d.note(f"چک {lt('allowlist')} ممکن نشد ({lt(p['el_err'])})؛ در زمان مینت دوباره چک می‌شود.", "warn")
         d.quote(f"{e('info')} سقف هر ولت <b>جدا برای هر مرحله</b> است (طبق {lt('OpenSea')}): مثلاً {lt('Limit 4')} در "
@@ -848,8 +839,7 @@ class Service:
             rows.append([ltr(n), f"<b>{lt(s['label'])}</b><br>{self.kind_fa(s['kind'])}",
                          f"{R.tm(s['start'])}<br>{R.rel(s['start'])}", f"<b>{ltr(qt)}</b>",
                          "رایگان" if not pr else ltr(f"{pr / 1e18:.6f} × {qt} = {pr * qt / 1e18:.6f} ETH")])
-        d.table(["#", "مرحله", "شروع", "تعداد", "هزینه"], rows, caption="مرحله‌های انتخاب‌شده",
-                align=["center", "right", "right", "center", "left"])
+        d.table(["#", "مرحله", "شروع", "تعداد", "هزینه"], rows, caption="مرحله‌های انتخاب‌شده")
         ranges = [(s, s["min_unit"], s["max_unit"]) for s, _ in proj if s["max_unit"] != s["price_wei"] or s["min_unit"] != s["price_wei"]]
         money = [("جمع قیمت (حداکثر)", f"<b>{R.eth(total)}</b>"), ("گس تقریبی", ltr(f"~{gas / 1e18:.4f} ETH")),
                  ("موجودی ولت", R.eth(p["bal"]))]
@@ -929,7 +919,7 @@ class Service:
             pass
         d = (Doc().h("مسلح شد!", "fire", 2)
              .p("ربات منتظر لحظهٔ شروع هر مرحله می‌ماند و <b>همان لحظه شلیک می‌کند</b>.")
-             .table(["تسک", "مرحله", "تعداد", "شروع", "آماده‌سازی"], rows, align=["center", "right", "center", "right", "right"])
+             .table(["تسک", "مرحله", "تعداد", "شروع", "آماده‌سازی"], rows)
              .footer(f"{e('bell')} نتیجهٔ هر مرحله همین‌جا اطلاع داده می‌شود · «📋 تسک‌ها» برای پیگیری"))
         await self.say(q.message, d, self.menu(), effect=ui.EFFECT_FIRE)
 
@@ -973,7 +963,7 @@ class Service:
         txt = (Doc().h("تنظیمات", "gear", 2)
                .h("واکنش به تغییر قیمت", "usd", 4)
                .p("اگر سازنده هنگام شروع یا حین مینت قیمت را عوض کند، ربات چه کند؟")
-               .table(["حالت", "رفتار"], [[a, b] for _, a, b in rows_], align=["right", "right"])
+               .table(["حالت", "رفتار"], [[a, b] for _, a, b in rows_])
                .kv([("فعلی", f"<b>{esc(self.policy_line(pref))}</b>"), ("سقف تسک فعال", ltr(self.max_active()))])
                .note("ربات همیشه دقیقاً همان مبلغی را می‌فرستد که قرارداد می‌خواهد و هرگز بیشتر از سقف. "
                      "تنظیم روی برنامه‌هایی اعمال می‌شود که از این به بعد مسلح می‌کنید.", "shield"))
@@ -1050,7 +1040,7 @@ class Service:
                 elif t["tx_hash"]:
                     row.append(btn("تراکنش", url=ui.tx_url(t["tx_hash"]), icon="link"))
                 rows.append(row)
-            d.table(["#", "کالکشن / مرحله", "وضعیت", "شروع"], trs, caption=head, align=["center", "right", "right", "right"])
+            d.table(["#", "کالکشن / مرحله", "وضعیت", "شروع"], trs, caption=head)
         rows.append([btn("بروزرسانی", "tl", icon="refresh")])
         return d, kb(*rows)
 

@@ -18,7 +18,7 @@ def premium_on(monkeypatch):
 def sample():
     return (Doc().h("عنوان " + R.esc("<x>"), "ok").p(f"متن {lt('Limit 1 per wallet')}").hr()
             .kv([("ولت", mono("0x" + "a" * 40)), None, ("قیمت", R.price(10 ** 15))], caption="جزئیات")
-            .table(["#", "نام"], [["1", lt("OG & co")]], caption="مرحله‌ها", align=["center", "right"])
+            .table(["#", "نام"], [["1", lt("OG & co")]], caption="مرحله‌ها")
             .checklist([(True, "یک"), (False, "دو")]).ul(["a", None, "b"]).ol(["x"])
             .quote("خط۱\nخط۲", expandable=True, cite="منبع").note("نکته", "warn")
             .details("بیشتر", "<p>داخل<br>دوم</p>").math(r"1 \times 2 = 2", "1×2=2").footer("پایان"))
@@ -32,7 +32,7 @@ def test_doc_rich_and_classic_are_valid_and_escaped():
     assert '<input type="checkbox" checked>یک' in h and "<tg-math-block>1 \\times 2 = 2</tg-math-block>" in h
     assert "<blockquote expandable>خط۱<br>خط۲<cite>منبع</cite></blockquote>" in h
     assert "عنوان &lt;x&gt;" in h
-    assert "OG &amp; co" in h and "<td align=\"center\">1</td>" in h
+    assert "OG &amp; co" in h and "<td align=\"center\" valign=\"middle\">1</td>" in h
     c = d.classic()
     assert "<table" not in c and "<input" not in c and "<br" not in c and "✅</tg-emoji> یک" in c and "1×2=2" in c
 
@@ -163,3 +163,16 @@ def test_premium_refusal_strips_custom_emoji_inside_rich_html(monkeypatch):
     assert run(go()).message_id == 3
     assert "<tg-emoji" in seen[0]["rich_message"]["html"] and "<tg-emoji" not in seen[1]["rich_message"]["html"]
     assert seen[1]["rich_message"]["is_rtl"] is True and ui.PREMIUM is False
+
+
+def test_every_table_cell_is_centered():
+    import re
+    h = sample().html()
+    cells = re.findall(r"<t[dh][^>]*>", h)
+    assert cells and all(c.endswith(' align="center" valign="middle">') for c in cells), cells
+
+
+def test_note_is_pull_quote_with_optional_icon_and_cite():
+    d = Doc().note("a<br>b", None, cite="X").note("c", "warn")
+    assert d.html().startswith("<aside>a<br>b<cite>X</cite></aside><aside><tg-emoji")
+    assert "<blockquote>a\nb — X</blockquote>" in d.classic()

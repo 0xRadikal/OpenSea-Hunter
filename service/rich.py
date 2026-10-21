@@ -72,6 +72,12 @@ def price(wei):
 E = ui.e   # inline custom emoji (falls back to the plain emoji when premium is off)
 
 
+def _cell(tag, v):
+    """Table cell, content centered horizontally and vertically. Measured live 2026-10-21: without `align` Telegram
+    lays RTL cells out right-aligned, so alignment is always explicit."""
+    return f'<{tag} align="center" valign="middle">{v}</{tag}>'
+
+
 class Doc:
     """Builder for one rich screen. Every method appends one block and returns self."""
 
@@ -97,9 +103,12 @@ class Doc:
         rich = f"<blockquote{' expandable' if expandable else ''}>{text.replace(chr(10), '<br>')}{c}</blockquote>"
         return self._add("q", rich, f"<blockquote{' expandable' if expandable else ''}>{text}</blockquote>")
 
-    def note(self, text, icon="info"):
-        """Highlighted pull-quote style hint."""
-        return self._add("note", f"<aside>{E(icon)} {text}</aside>", f"<blockquote>{E(icon)} {text}</blockquote>")
+    def note(self, text, icon="info", cite=None):
+        """Pull quote (<aside>): Telegram renders its text centered. icon=None -> no leading emoji."""
+        t = f"{E(icon)} {text}" if icon else text
+        c = f"<cite>{cite}</cite>" if cite else ""
+        return self._add("note", f"<aside>{t}{c}</aside>",
+                         f"<blockquote>{t.replace('<br>', chr(10))}{' — ' + cite if cite else ''}</blockquote>")
 
     def ul(self, items):
         items = [i for i in items if i]
@@ -125,20 +134,18 @@ class Doc:
         if not rows:
             return self
         cap = f"<caption>{caption}</caption>" if caption else ""
-        body = "".join(f"<tr><td><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows)
+        body = "".join(f"<tr>{_cell('td', f'<b>{k}</b>')}{_cell('td', v)}</tr>" for k, v in rows)
         rich = f"<table bordered{' striped' if striped else ''} compact>{cap}{body}</table>"
         classic = (f"<b>{caption}</b>\n" if caption else "") + "\n".join(f"<b>{k}:</b> {v}" for k, v in rows)
         return self._add("table", rich, classic)
 
-    def table(self, head, rows, caption=None, align=None):
-        """Multi-column table. align: list of 'right'|'center'|'left' per column."""
+    def table(self, head, rows, caption=None):
+        """Multi-column table; every cell centered (see _cell)."""
         if not rows:
             return self
-        al = align or [None] * len(head)
-        cell = lambda tag, v, a: f"<{tag}{f' align={chr(34)}{a}{chr(34)}' if a else ''}>{v}</{tag}>"
         cap = f"<caption>{caption}</caption>" if caption else ""
-        rich = (f"<table bordered striped compact>{cap}<tr>" + "".join(cell("th", h, a) for h, a in zip(head, al)) + "</tr>"
-                + "".join("<tr>" + "".join(cell("td", v, a) for v, a in zip(r, al)) + "</tr>" for r in rows) + "</table>")
+        rich = (f"<table bordered striped compact>{cap}<tr>" + "".join(_cell("th", h) for h in head) + "</tr>"
+                + "".join("<tr>" + "".join(_cell("td", v) for v in r) + "</tr>" for r in rows) + "</table>")
         classic = (f"<b>{caption}</b>\n" if caption else "") + "\n".join(
             " · ".join(f"{v}" for v in r) for r in rows)
         return self._add("table", rich, classic)
