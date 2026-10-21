@@ -259,6 +259,10 @@ class Runner:
         if t["max_unit_wei"] is not None:
             cmd += ["--max-unit-wei", str(t["max_unit_wei"])]
         cmd += self.extra_args
+        if not self.db.transition(tid, ("scheduled",), status="running", pid=None):
+            del pk, api_key                                   # cancelled/finished since the tick snapshot
+            log.info("task %s: not scheduled any more, spawn skipped", tid)
+            return
         fd = os.open(self.log_path(tid), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fd, stderr=subprocess.STDOUT,
@@ -271,7 +275,16 @@ class Runner:
         finally:
             del pk, api_key
         self.procs[tid] = p
-        self.db.update_task(tid, status="running", pid=p.pid)
+        if not self.db.transition(tid, ("running",), pid=p.pid):
+            # cancelled while the engine was starting: stop it immediately (nothing may be sent for a cancelled task)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            self.procs.pop(tid, None)
+            self.db.audit(uid, "task_spawn_aborted", f"task {tid} pid {p.pid} (cancelled during start)")
+            log.info("task %s cancelled during start; engine pid %s terminated", tid, p.pid)
+            return
         self.db.audit(uid, "task_spawn", f"task {tid} pid {p.pid}")
         log.info("spawned task %s pid %s", tid, p.pid)
 
@@ -279,19 +292,27 @@ class Runner:
         t = self.db.task(tid)
         if not t or t["user_id"] != uid or t["status"] not in ("scheduled", "running"):
             return False
-        if t["status"] == "running" and t["pid"] and pid_is_task(t["pid"], tid):
+        if not self.db.transition(tid, ("scheduled", "running"), status="cancelled", result="لغو توسط کاربر"):
+            return False                                      # finished/cancelled concurrently
+        t = self.db.task(tid)                                 # pid as of the cancel (spawn may have just set it)
+        if t["pid"] and pid_is_task(t["pid"], tid):
             try:
                 os.killpg(t["pid"], signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        self.db.update_task(tid, status="cancelled", result="لغو توسط کاربر")
         self.db.audit(uid, "task_cancel", str(tid))
         self.procs.pop(tid, None)
         return True
 
     def _finish(self, t, status, detail):
         res = parse_result(self.log_path(t["id"])) or {}
-        self.db.update_task(t["id"], status=status, result=detail[:900], tx_hash=res.get("tx"))
+        if not self.db.transition(t["id"], ("scheduled", "running"), status=status, result=detail[:900], tx_hash=res.get("tx")):
+            # already final (e.g. user cancelled after this tick's snapshot): keep that state, notify nobody.
+            # Exception: a cancelled task whose engine still minted must not lose the tx record.
+            if res.get("minted") and res.get("tx"):
+                self.db.update_task(t["id"], tx_hash=res.get("tx"), result=("minted after cancel: " + detail)[:900])
+            self.procs.pop(t["id"], None)
+            return
         self.procs.pop(t["id"], None)
         icon = {"minted": "✅", "failed": "❌", "ended": "⌛", "cancelled": "🚫", "not_eligible": "⛔"}.get(status, "ℹ️")
         if self.notify_rich:

@@ -119,12 +119,20 @@ class DB:
     def record_payment(self, charge_id, uid, stars, payload, days):
         """Idempotent: a duplicate charge id (Telegram redelivery) never extends twice. Returns new expiry or None."""
         with self.lock:
+            self.c.execute("BEGIN IMMEDIATE")       # charge row + subscription extension: all or nothing
             try:
-                self.x("INSERT INTO payments(charge_id,user_id,stars,payload,created) VALUES(?,?,?,?,?)",
-                       (charge_id, uid, stars, payload, int(time.time())))
-            except sqlite3.IntegrityError:
-                return None
-            return self.extend_sub(uid, days)
+                try:
+                    self.x("INSERT INTO payments(charge_id,user_id,stars,payload,created) VALUES(?,?,?,?,?)",
+                           (charge_id, uid, stars, payload, int(time.time())))
+                except sqlite3.IntegrityError:
+                    self.c.execute("ROLLBACK")
+                    return None
+                new = self.extend_sub(uid, days)
+                self.c.execute("COMMIT")
+                return new
+            except Exception:
+                self.c.execute("ROLLBACK")
+                raise
 
     # ------------------------------------------------------------------ TON payments (service/ton_pay.py)
     def ton_invoice_for(self, uid, price, days, now, ttl, memo_fn, step, max_off):
@@ -377,8 +385,11 @@ class DB:
 
     def add_plan(self, uid, wid, slug, nft, items, max_active, plan_id):
         """Atomically insert one task per stage of a plan. items: [{label,start,end,kind,price_wei,quantity}].
-        All-or-nothing. Returns [ids], "dup" (some stage already has an active task) or "limit"."""
+        All-or-nothing. Returns [ids], "dup" (some stage already has an active task), "limit", or "nowallet"
+        (the wallet was deleted after the plan was built)."""
         with self.lock:
+            if not self.wallet(uid, wid):
+                return "nowallet"
             if any(self.duplicate_task(uid, wid, nft, it["label"]) for it in items):
                 return "dup"
             if self.active_count(uid) + len(items) > max_active:
@@ -433,3 +444,15 @@ class DB:
         kw["updated"] = int(time.time())
         cols = ",".join(f"{k}=?" for k in kw)
         self.x(f"UPDATE tasks SET {cols} WHERE id=?", (*kw.values(), tid))
+
+    def transition(self, tid, from_status, **kw):
+        """Compare-and-set: update the task only if its CURRENT status is in `from_status`.
+        Returns True if the row changed. Prevents a stale snapshot (runner tick) from overwriting a newer state
+        (e.g. user cancel) and vice versa."""
+        kw["updated"] = int(time.time())
+        cols = ",".join(f"{k}=?" for k in kw)
+        marks = ",".join("?" * len(from_status))
+        with self.lock:
+            cur = self.c.execute(f"UPDATE tasks SET {cols} WHERE id=? AND status IN ({marks})",
+                                 (*kw.values(), tid, *from_status))
+            return cur.rowcount == 1

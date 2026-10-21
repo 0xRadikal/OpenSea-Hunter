@@ -86,8 +86,8 @@ def check_drop(drop):
     nft = (drop.get("contract_address") or "").lower()
     if len(nft) != 42:
         raise PreflightError("آدرس قرارداد در پاسخ OpenSea نیست")
-    ms, ts = drop.get("max_supply"), drop.get("total_supply")
-    if ms and ts and ms.isdigit() and ts.isdigit() and int(ts) >= int(ms):
+    ms, ts = str(drop.get("max_supply") or ""), str(drop.get("total_supply") or "")   # API may send str or int
+    if ms.isdigit() and ts.isdigit() and int(ms) and int(ts) >= int(ms):
         raise PreflightError("ظرفیت دراپ تمام شده (sold out)")
     return nft
 

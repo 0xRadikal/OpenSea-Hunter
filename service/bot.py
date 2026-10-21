@@ -626,6 +626,7 @@ class Service:
 
     @staticmethod
     def parse_key_text(text):
+        """Bare key or OpenSea's JSON ({"api_key", "expires_at"} / {"errors": [...]}). Never raises (any shape)."""
         t = (text or "").strip()
         exp = None
         if t.startswith("{"):
@@ -633,22 +634,30 @@ class Service:
                 j = json.loads(t)
             except ValueError:
                 return None, None
-            if j.get("errors"):
-                return "ERR:" + str(j["errors"][0])[:150], None
-            t = str(j.get("api_key") or "")
-            if j.get("expires_at"):
+            if not isinstance(j, dict):
+                return None, None
+            err = j.get("errors")
+            if err:
+                first = err[0] if isinstance(err, list) else err
+                return "ERR:" + str(first)[:150], None
+            t = str(j.get("api_key") or "").strip()
+            ea = j.get("expires_at")
+            if isinstance(ea, (int, float)) and not isinstance(ea, bool) and ea > 0:
+                exp = int(ea)
+            elif isinstance(ea, str) and ea:
                 try:
-                    exp = int(dt.datetime.fromisoformat(j["expires_at"].replace("Z", "+00:00")).timestamp())
+                    exp = int(dt.datetime.fromisoformat(ea.replace("Z", "+00:00")).timestamp())
                 except ValueError:
                     exp = None
         return t, exp
 
     async def got_key(self, u: Update, c):
-        key, exp = self.parse_key_text(u.message.text)
-        try:
+        text = u.message.text
+        try:                                                 # delete FIRST: the message holds a secret
             await u.message.delete()
         except Exception:  # noqa: BLE001
             pass
+        key, exp = self.parse_key_text(text)
         if key and key.startswith("ERR:"):
             return await self.say(u, Doc().p(f"{e('no')} <b>{lt('OpenSea')} خطا داد:</b> {lt(key[4:])}")
                                   .footer(f"سقف ساخت کلید فوری ۲ عدد در روز برای هر {lt('IP')} است."))
@@ -1043,7 +1052,14 @@ class Service:
                           "price_wei": s["price_wei"], "quantity": s["qty"], "policy": pref["price_policy"], "uuid": s["uuid"],
                           "min_unit": lo, "max_unit": hi})
         plan_id = os.urandom(6).hex()
-        res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.max_active(), plan_id)
+        try:
+            res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.max_active(), plan_id)
+        except Exception:                                    # never leave the plan stuck in "arming"
+            p["step"] = "summary"
+            raise
+        if res == "nowallet":
+            c.user_data.pop("plan", None)
+            return await self.say(q.message, Doc().p(f"{e('stop')} این ولت حذف شده است؛ تسک جدید بسازید."), self.menu())
         if res in ("dup", "limit"):
             p["step"] = "summary"
             return await self.say(q.message, Doc().p(f"{e('stop')} " + ("برای یکی از این مرحله‌ها با این ولت قبلاً تسک فعال دارید."
@@ -1277,7 +1293,7 @@ class Service:
         if hint:
             return await self.say(u, Doc().p(f"{e('info')} {hint} (یا {lt('/cancel')})."))
         # a pasted private key outside the flow: delete it anyway
-        if len(t) in (64, 66) and all(ch in "0123456789abcdefABCDEFx" for ch in t):
+        if re.fullmatch(r"(0[xX])?[0-9a-fA-F]{64}", t.strip().strip('"').strip("'")):
             try:
                 await u.message.delete()
             except Exception:  # noqa: BLE001
@@ -1292,6 +1308,19 @@ class Service:
                 return await self.got_link(u, c)
             return await self.new_task(u, c)
         await self.say(u, Doc().p(f"{e('info')} از دکمه‌های منو استفاده کنید یا لینک کالکشن {lt('OpenSea')} را بفرستید."), self.menu())
+
+    async def edited(self, u: Update, c):
+        """An edited message is never treated as input. Only safety: if the NEW text looks like a private key,
+        delete it (the original was handled when it was sent)."""
+        m = u.edited_message
+        t = (m.text or "").strip().strip('"').strip("'")
+        if re.fullmatch(r"(0[xX])?[0-9a-fA-F]{64}", t):
+            try:
+                await m.delete()
+            except Exception:  # noqa: BLE001
+                return await self.say(m, Doc().p(f"{e('siren')} پیام ویرایش‌شده شبیه کلید خصوصی است؛ <b>لطفاً خودتان پاکش کنید.</b>"))
+            await self.say(m, Doc().p(f"{e('siren')} پیام ویرایش‌شده شبیه کلید خصوصی بود و <b>پاک شد</b>. "
+                                      "برای ثبت ولت از «👛 ولت‌ها» اقدام کنید."))
 
     # ------------------------------------------------------------------ admin
     def is_admin(self, u):
@@ -1459,8 +1488,10 @@ class Service:
         app.add_handler(CallbackQueryHandler(self.task_cancel, pattern=r"^tc:\d+$"))
         app.add_handler(PreCheckoutQueryHandler(self.precheckout))
         app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.paid))
-        app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA & P, self.webapp_data))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & P, self.text))
+        NEW = filters.UpdateType.MESSAGE                      # edited messages are NOT new input (were crashing: u.message None)
+        app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA & P & NEW, self.webapp_data))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & P & NEW, self.text))
+        app.add_handler(MessageHandler(filters.TEXT & P & filters.UpdateType.EDITED_MESSAGE, self.edited))
         app.add_error_handler(self._on_error)
         self.app = app
         return app
