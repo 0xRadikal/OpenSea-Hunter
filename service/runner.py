@@ -118,20 +118,69 @@ def speed_text(sp):
 
 
 def result_card(t, status, detail, res=None):
-    """HTML notification card + inline buttons for a finished task. `detail` is the plain-text result."""
+    """Rich RTL notification card (service.rich.Doc) + inline buttons for a finished task.
+    `detail` is the plain-text result (also stored in the DB); for a mint the card is built from the structured result."""
+    from . import rich as R
+    from .rich import Doc, lt, ltr, mono
     res = res or {}
     head = {"minted": ("party", "مینت موفق!"), "failed": ("no", "مینت انجام نشد"), "ended": ("wait", "مرحله تمام شد"),
             "cancelled": ("stop", "تسک لغو شد"), "not_eligible": ("stop", "خارج از allowlist")}.get(status, ("info", "نتیجهٔ تسک"))
-    body = "\n".join(l for l in (detail or "").splitlines() if not l.startswith("tx: "))
-    txt = (f"{ui.e(head[0])} <b>{head[1]}</b> — تسک #{t['id']}\n"
-           f"{ui.e('gem')} {ui.esc(t['slug'])} · {ui.esc(t['stage_label'])}\n{ui.SEP}\n{ui.esc(body)}")
-    rows = []
+    d = Doc().h(head[1] + " " + ltr(f"#{t['id']}"), head[0], 2)
+    rows = [("کالکشن", lt(t["slug"])), ("مرحله", lt(t["stage_label"]))]
     tx = res.get("tx")
-    if tx:
-        rows.append([ui.btn("مشاهده تراکنش", url=ui.tx_url(tx), icon="search"), ui.btn("کپی tx", copy=tx, icon="link")])
     if status == "minted":
-        rows.append([ui.btn("کالکشن در OpenSea", url=f"https://opensea.io/collection/{t['slug']}", icon="gem")])
-    return txt, ui.kb(*rows) if rows else None
+        ids = res.get("token_ids") or []
+        n, want = len(ids), res.get("wanted") or 1
+        rows.append(("تعداد", f"<b>{ltr(n)}</b>" + (f" از {ltr(want)} درخواستی" if n < want else "")))
+        if ids:
+            shown = ", ".join(f"#{i}" for i in ids[:12]) + (" …" if len(ids) > 12 else "")
+            rows.append(("توکن", ltr(shown)))
+        sp = res.get("speed") or {}
+        if "unit_price" in sp:
+            rows.append(("قیمت پرداختی هر عدد", R.eth(sp["unit_price"])))
+        if tx:
+            rows.append(("تراکنش", mono(tx[:10] + "…" + tx[-6:])))
+        d.kv(rows)
+        d.p(R.esc(detail.splitlines()[0]) if detail else "")        # «مینت انجام شد — N عدد …» (plain summary line)
+        speed_doc(d, sp)
+    else:
+        d.kv(rows)
+        body = "\n".join(l for l in (detail or "").splitlines() if not l.startswith("tx: "))
+        d.note(R.esc(body), "warn" if status in ("failed", "not_eligible") else "info")
+    d.footer("Ray Minter · Robinhood Chain")
+    mk = []
+    if tx:
+        mk.append([ui.btn("مشاهده تراکنش", url=ui.tx_url(tx), icon="search"), ui.btn("کپی tx", copy=tx, icon="link")])
+    if status == "minted":
+        mk.append([ui.btn("کالکشن در OpenSea", url=f"https://opensea.io/collection/{t['slug']}", icon="gem")])
+    return d, ui.kb(*mk) if mk else None
+
+
+def speed_doc(d, sp):
+    """Speed report as a table (same numbers as speed_text)."""
+    from .rich import lt, ltr
+    if not sp:
+        return d
+    late = "late_start" in sp
+    pre = "own_" if late else ""
+    rows = [[lab, ltr(f"{sp[pre + k]:+.3f} s")] for k, lab in (
+        ("api_win", f"امضا/calldata از {lt('OpenSea')}"), ("sent", f"ارسال تراکنش (پذیرش {lt('sequencer')})"),
+        ("receipt", "تأیید روی زنجیره (رسید)")) if pre + k in sp]
+    if "block" in sp:
+        b = f"{ltr(sp['block'])} · ردیف {ltr(sp.get('tx_index', '?'))}"
+        if not late and "block_delta" in sp:
+            b += f" · زمان بلاک {ltr(format(sp['block_delta'], '+d') + ' s')}"
+        rows.append(["بلاک", b])
+    if "rank" in sp:
+        rows.append(["رتبهٔ ما" if not late else "رتبه", f"<b>{ltr('#' + str(sp['rank']))}</b>"
+                     + (" — معیار رقابت نیست" if late else "")])
+    late_s = f"{sp['late_start']:.0f}" if late else ""
+    cap = (f"⚡ سرعت ربات — از لحظهٔ شلیک (تسک {ltr(late_s)} ث بعد از شروع مرحله اجرا شد)" if late
+           else "⚡ سرعت — از لحظهٔ شروع مرحله")
+    d.table(["گام", "زمان"], rows, caption=cap, align=["right", "left"])
+    if late:
+        d.note("تسک بعد از شروع مرحله ثبت شد؛ این گزارش سرعت خود ربات است، نه رقابت از لحظهٔ شروع.", "info")
+    return d
 
 
 def classify(res, log_tail=""):
@@ -288,7 +337,11 @@ class Runner:
             msg = (f"⚠️ کلید API شما قبل از پایان مرحلهٔ تسک #{t['id']} منقضی می‌شود. "
                    "لطفاً از منوی «🔑 کلید API» کلید جدید ثبت کنید.")
             if self.notify_rich:
-                self.notify_rich(t["user_id"], f"{ui.e('warn')} <b>هشدار کلید API</b>\n{ui.esc(msg[2:])}",
+                from .rich import Doc, ltr
+                doc = (Doc().h(f"هشدار کلید {ltr('API')}", "warn", 3)
+                       .p(f"کلید {ltr('API')} شما قبل از پایان مرحلهٔ تسک {ltr('#' + str(t['id']))} منقضی می‌شود.")
+                       .note("از منوی «🔑 کلید API» یا دکمهٔ زیر کلید جدید ثبت کنید.", "lock"))
+                self.notify_rich(t["user_id"], doc,
                                  ui.kb([ui.btn("افزودن کلید API", "kset", style="success", icon="plus")]), None)
             else:
                 self.notify(t["user_id"], msg)

@@ -182,6 +182,10 @@ def strip_premium(data):
         if isinstance(v, str) and "<tg-emoji" in v:
             out[k] = _EMOJI_TAG.sub(r"\1", v)
             changed = True
+    rmsg = out.get("rich_message")
+    if isinstance(rmsg, dict) and "<tg-emoji" in str(rmsg.get("html", "")):
+        out["rich_message"] = dict(rmsg, html=_EMOJI_TAG.sub(r"\1", rmsg["html"]))
+        changed = True
     rm = out.get("reply_markup")
     if rm is not None:
         d = rm.to_dict() if hasattr(rm, "to_dict") else rm

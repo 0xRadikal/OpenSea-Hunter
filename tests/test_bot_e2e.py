@@ -122,19 +122,21 @@ def test_full_flow(world):
     m = tg.mark(); tg.text(U, "🎯 تسک جدید"); tg.wait_text(U, "لینک کالکشن", since=m)
     m = tg.mark(); tg.text(U, f"https://opensea.io/item/robinhood/{fu.NFT}/3")
     msg = tg.wait_text(U, "با کدام ولت", since=m)[1]
-    assert "OG List" in msg["text"] and "🟢 <b>Public</b>" in msg["text"] and "سقف هر ولت: 1" in msg["text"]
+    assert "🟢 OG List | Allowlist (امضادار) | رایگان | 1 |" in msg["text"]
+    assert "🟢 Public | Public (عمومی) | 0.100000 ETH | 5 |" in msg["text"]
+    assert "\u2066OG List\u2069" in msg["_rich"]["html"] and msg["_rich"]["is_rtl"] is True       # rich RTL + isolated Latin
     m = tg.mark(); tg.callback(U, wallet_btn(msg, a.address))
     sel = tg.wait_text(U, "مرحله(ها) را انتخاب", since=m, timeout=40)[1]
-    assert "✅ allowlist هست" in sel["text"] and "Limit 1 per wallet" in sel["text"]
+    assert "| ✅ هست | Limit 1 | حداکثر 1 | —" in sel["text"] and "\u2066Limit 1\u2069" in sel["_rich"]["html"]
     m = tg.mark(); tg.callback(U, stage_btn(sel, "OG List")); qm = tg.wait_text(U, "چند عدد مینت کنید", since=m)[1]
-    assert "Limit 1 per wallet" in qm["text"] and "حداکثر قابل مینت برای شما در این مرحله: <b>1</b>" in qm["text"]
-    m = tg.mark(); tg.callback(U, btn_by(qm, "حداکثر")); sel = tg.wait_text(U, "انتخاب شما: <b>1 عدد</b>", since=m)[1]
+    assert "سقف هر ولت در این مرحله | Limit 1 per wallet" in qm["text"] and "حداکثر قابل مینت برای شما در این مرحله | 1" in qm["text"]
+    m = tg.mark(); tg.callback(U, btn_by(qm, "حداکثر")); sel = tg.wait_text(U, "| Limit 1 | حداکثر 1 | 1", since=m)[1]
     m = tg.mark(); tg.callback(U, "pn"); tg.wait_text(U, "خلاصهٔ برنامهٔ مینت", since=m)
     m = tg.mark(); tg.callback(U, "pa"); tg.callback(U, "pa"); tg.callback(U, "pa")          # triple tap
     tg.wait_text(U, "مسلح شد", since=m); time.sleep(1.0)
     assert len(svc.db.tasks(U)) == 1, [dict(t) for t in svc.db.tasks(U)]
     # runner picks it up, engine mints at T0 on the fork, user gets notified
-    tg.wait_text(U, "مینت انجام شد", timeout=150)
+    tg.wait_text(U, "مینت موفق! #1", timeout=150)
     assert fu.holds(a.address) == 1
     assert svc.db.tasks(U)[0]["status"] == "minted"
 
@@ -148,7 +150,7 @@ def test_full_flow(world):
     m = tg.mark(); tg.text(BAD, slug); msg = tg.wait_text(BAD, "با کدام ولت", since=m)[1]
     m = tg.mark(); tg.callback(BAD, wallet_btn(msg, b.address))
     sel = tg.wait_text(BAD, "مرحله(ها) را انتخاب", since=m, timeout=40)[1]
-    assert "⛔ <b>OG List</b>" in sel["text"] and "در allowlist این مرحله نیست" in sel["text"]
+    assert "⛔ OG List" in sel["text"] and "| طبق OpenSea این ولت در allowlist این مرحله نیست |" in sel["text"]
     assert not any("OG List" in r[0]["text"] for r in sel["reply_markup"]["inline_keyboard"])
     m = tg.mark(); tg.callback(BAD, "ps:0"); tg.wait_text(BAD, "جلسه منقضی شد", since=m)       # forged callback refused
     m = tg.mark(); tg.callback(BAD, "px"); tg.wait_text(BAD, "لغو شد", since=m)
@@ -178,14 +180,14 @@ def test_full_flow(world):
     # second API key -> each concurrent stage gets its OWN key; same key twice is deduplicated
     fo.valid_keys.add("q" * 32)
     m = tg.mark(); tg.webapp(U, json.dumps({"api_key": "q" * 32, "expires_at": iso(time.time() + 7 * 86400)}))
-    tg.wait_text(U, "کلیدهای معتبر شما: 2", since=m)
+    tg.wait_text(U, "کلیدهای معتبر شما | 2", since=m)
     m = tg.mark(); tg.webapp(U, json.dumps({"api_key": "q" * 32, "expires_at": iso(time.time() + 7 * 86400)}))
     tg.wait_text(U, "قبلاً ثبت شده", since=m)
     m = tg.mark(); tg.text(U, "🔑 کلید API"); km = tg.wait_text(U, "کلیدهای API شخصی", since=m)[1]["text"]
     assert km.count("🟢") == 2
     # settings: price policy -> cap +25% (only affects plans armed from now on)
     m = tg.mark(); tg.text(U, "⚙️ تنظیمات"); st_ = tg.wait_text(U, "واکنش به تغییر قیمت", since=m)[1]
-    assert "فقط با همان قیمت" in st_["text"] and "سقف تسک فعال: 20" in st_["text"]
+    assert "فقط با همان قیمت" in st_["text"] and "سقف تسک فعال | 20" in st_["text"]
     m = tg.mark(); tg.callback(U, "cp:cap"); st_ = tg.wait_text(U, "تا سقف افزایش مشخص", since=m)[1]
     m = tg.mark(); tg.callback(U, "cpp:25"); tg.wait_text(U, "سقف +25٪", since=m)
     assert svc.db.prefs(U) == {"user_id": U, "price_policy": "cap", "max_increase_pct": 25}
@@ -196,31 +198,34 @@ def test_full_flow(world):
     m = tg.mark(); tg.text(U, "2"); tg.wait_text(U, "ولت را از دکمه", since=m)                    # typed while choosing
     m = tg.mark(); tg.callback(U, wallet_btn(msg, c_.address))
     sel = tg.wait_text(U, "مرحله(ها) را انتخاب", since=m, timeout=40)[1]
-    assert "جدا برای هر مرحله" in sel["text"] and "تجمعی" not in sel["text"] and "Limit 10 per wallet" in sel["text"]
+    assert "جدا برای هر مرحله" in sel["text"] and "تجمعی" not in sel["text"] and "| Limit 10 | حداکثر 10 | —" in sel["text"]
     # Allowlist: custom amount 2 (Persian digits)
     m = tg.mark(); tg.callback(U, stage_btn(sel, "Allowlist")); qm = tg.wait_text(U, "چند عدد مینت کنید", since=m)[1]
     m = tg.mark(); tg.text(U, "hello"); tg.wait_text(U, "تعداد را با دکمه", since=m)
     m = tg.mark(); tg.callback(U, btn_by(qm, "عدد دلخواه")); tg.wait_text(U, "عدد مورد نظر را بفرستید", since=m)
-    m = tg.mark(); tg.text(U, "99"); tg.wait_text(U, "یک عدد بین ۱ و 10", since=m)              # above max -> refused
-    m = tg.mark(); tg.text(U, "۲"); sel = tg.wait_text(U, "انتخاب شما: <b>2 عدد</b>", since=m)[1]
+    m = tg.mark(); tg.text(U, "99"); tg.wait_text(U, "یک عدد بین 1 و 10", since=m)              # above max -> refused
+    m = tg.mark(); tg.text(U, "۲"); sel = tg.wait_text(U, "| Limit 10 | حداکثر 10 | 2", since=m)[1]
     # Public: preset 3
     m = tg.mark(); tg.callback(U, stage_btn(sel, "Public stage")); qm = tg.wait_text(U, "چند عدد مینت کنید", since=m)[1]
-    assert "قیمت هر عدد: 0.001000 ETH" in qm["text"]
-    m = tg.mark(); tg.callback(U, btn_by(qm, "3")); sel = tg.wait_text(U, "انتخاب شما: <b>3 عدد</b>", since=m)[1]
-    m = tg.mark(); tg.callback(U, "pn"); summ = tg.wait_text(U, "خلاصهٔ برنامهٔ مینت", since=m)[1]["text"]
-    assert "0.001000 × 3 = 0.003000 ETH" in summ and "تعداد: <b>2</b>" in summ and "رایگان" in summ
-    assert "قیمت قابل‌قبول هر عدد: 0.001000 تا 0.001250 ETH" in summ and "سقف +25٪" in summ
+    assert "قیمت هر عدد | 0.001000 ETH" in qm["text"]
+    m = tg.mark(); tg.callback(U, btn_by(qm, "3")); sel = tg.wait_text(U, "| حداکثر 9 | 3", since=m)[1]
+    m = tg.mark(); tg.callback(U, "pn"); summ_p = tg.wait_text(U, "خلاصهٔ برنامهٔ مینت", since=m)[1]; summ = summ_p["text"]
+    assert "| 3 | 0.001000 × 3 = 0.003000 ETH" in summ and "| 2 | رایگان" in summ
+    assert "قیمت قابل‌قبول Public stage | 0.001000 – 0.001250 ETH" in summ and "سقف +25٪" in summ
+    assert "<tg-math-block>0.00125 \\times 3 = 0.00375\\ \\mathrm{ETH}</tg-math-block>" in summ_p["_rich"]["html"]
     assert "کلید هر مرحله" in summ and "کلید مشترک" not in summ
     m = tg.mark(); tg.text(U, "ok"); tg.wait_text(U, "برنامه هنوز ثبت نشده", since=m)
     b0 = fu.eth(c_.address)
     m = tg.mark(); tg.callback(U, "pa"); arm = tg.wait_text(U, "مسلح شد", since=m)[1]["text"]
-    assert "Allowlist × 2" in arm and "Public stage × 3" in arm
-    done2 = tg.wait_text(U, "مینت انجام شد — 2 عدد", timeout=150, since=m)[1]["text"]
-    done3 = tg.wait_text(U, "مینت انجام شد — 3 عدد", timeout=150, since=m)[1]["text"]
-    for d in (done2, done3):
-        assert "⚡ سرعت" in d and "ارسال تراکنش" in d and ("رتبهٔ ما" in d or "معیار رقابت نیست" in d), d
+    assert "| Allowlist | 2 |" in arm and "| Public stage | 3 |" in arm
+    done2 = tg.wait_text(U, "مینت انجام شد — 2 عدد", timeout=150, since=m)[1]
+    done3 = tg.wait_text(U, "مینت انجام شد — 3 عدد", timeout=150, since=m)[1]
+    for c_msg in (done2, done3):
+        d = c_msg["text"]
+        assert c_msg["_rich"]["is_rtl"] is True and c_msg.get("message_effect_id")
+        assert "⚡ سرعت ربات" in d and "ارسال تراکنش (پذیرش sequencer) |" in d and "تعداد |" in d, d
         assert "معیار رقابت نیست" in d           # stage started ~1 min before arming: reported as late, not a record
-    assert "قیمت پرداختی هر عدد: 0.001000 ETH" in done3
+    assert "قیمت پرداختی هر عدد | 0.001000 ETH" in done3["text"] and "تعداد | 3" in done3["text"]
     assert fu.holds(c_.address) == 5 and 3 * P <= b0 - fu.eth(c_.address) < 3 * P + 2 * 10 ** 14
     pts = sorted([t for t in svc.db.tasks(U) if t["slug"] == pslug], key=lambda t: t["id"])
     assert [(t["stage_label"], t["quantity"], t["kind"], t["status"]) for t in pts] == \
@@ -244,12 +249,23 @@ def test_full_flow(world):
     assert "سقف این مرحله برای این ولت پر است (Limit 10 per wallet)" in sel, sel
     assert len(svc.db.tasks(U)) == n_tasks
 
+    # ---- a Bot API server without Rich Messages: every screen still arrives as classic HTML (fallback)
+    tg.reject_rich = True
+    try:
+        m = tg.mark(); tg.text(U, "⚙️ تنظیمات")
+        c_ = tg.wait(lambda c: c[0] == "sendMessage" and str(c[1].get("chat_id")) == str(U) and "واکنش به تغییر قیمت" in c[1].get("text", ""),
+                     since=m)[1]
+        assert any(x[0] == "sendRichMessage:rejected" for x in tg.calls[m:]) and c_["parse_mode"] == "HTML"
+        assert "<table" not in c_.get("_raw_text", c_["text"]) and "سقف تسک فعال:" in c_["text"]
+    finally:
+        tg.reject_rich = False
+
     # ---- group chats are ignored entirely
     m = tg.mark()
     tg._push({"message": {"message_id": 1, "date": int(time.time()), "chat": {"id": -100, "type": "supergroup"},
                           "from": tg.user(U), "text": "/start", "entities": [{"type": "bot_command", "offset": 0, "length": 6}]}})
     time.sleep(1.0)
-    assert not [c for c in tg.calls[m:] if c[0] == "sendMessage" and str(c[1].get("chat_id")) == "-100"]
+    assert not [c for c in tg.calls[m:] if c[0] in ("sendMessage", "sendRichMessage") and str(c[1].get("chat_id")) == "-100"]
 
     # ---- admin
     m = tg.mark(); tg.text(U, "/setmax 50"); time.sleep(0.8)                                  # non-admin ignored
@@ -258,7 +274,7 @@ def test_full_flow(world):
     assert svc.max_active() == 50
     m = tg.mark(); tg.text(7, "/stats"); tg.wait_text(7, "minted 3", since=m)
     m = tg.mark(); tg.text(U, "/stats"); time.sleep(0.8)
-    assert not [c for c in tg.calls[m:] if c[0] == "sendMessage" and str(c[1].get("chat_id")) == str(U)]
+    assert not [c for c in tg.calls[m:] if c[0] in ("sendMessage", "sendRichMessage") and str(c[1].get("chat_id")) == str(U)]
 
     # ---- secrets never leave in bot output, never on disk in plaintext
     out = json.dumps([p for _, p in tg.calls], ensure_ascii=False)

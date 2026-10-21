@@ -12,14 +12,16 @@ import os
 import re
 import time
 
-from telegram import BotCommand, LabeledPrice, LinkPreviewOptions, Update, WebAppInfo
+from telegram import BotCommand, LabeledPrice, Update, WebAppInfo
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, PreCheckoutQueryHandler, filters)
 
 from . import preflight as pf
+from . import rich as R
 from . import ui
+from .rich import Doc, lt, ltr, mono
 from .ui import btn, e, kb, title, when
 from .config import Config
 from .db import DB
@@ -74,12 +76,13 @@ class Service:
 
     # ------------------------------------------------------------------ infra
     def notify(self, uid, text, html_=False, markup=None, effect=None):
-        """Thread-safe (runner runs in an executor thread). html_=True: text is already HTML-escaped."""
+        """Thread-safe (runner runs in an executor thread). html_=True: text is already HTML-escaped;
+        text may also be a rich.Doc (sent as an RTL rich message)."""
         if self.loop and self.app:
             asyncio.run_coroutine_threadsafe(self._send(uid, text, html_, markup, effect), self.loop)
 
-    def notify_rich(self, uid, html_text, markup=None, effect=None):
-        self.notify(uid, html_text, html_=True, markup=markup, effect=effect)
+    def notify_rich(self, uid, doc, markup=None, effect=None):
+        self.notify(uid, doc, html_=True, markup=markup, effect=effect)
 
     def notify_admins(self, text):
         for a in self.cfg.admin_ids:
@@ -87,7 +90,9 @@ class Service:
 
     async def _send(self, uid, text, html_=False, markup=None, effect=None):
         try:
-            if html_:
+            if isinstance(text, Doc):
+                await R.send(self.app.bot, uid, text, markup, effect)
+            elif html_:
                 await self.app.bot.send_message(uid, text[:4000], parse_mode=ParseMode.HTML, reply_markup=markup,
                                                 message_effect_id=effect)
             else:
@@ -102,36 +107,45 @@ class Service:
             rows.insert(2, [R(B_KEYPAGE, web_app=WebAppInfo(self.cfg.keypage_url))])
         return ui.reply_kb(rows, "لینک کالکشن OpenSea یا یکی از گزینه‌ها…")
 
-    async def say(self, u_or_msg, text, markup=None, **kw):
-        """Reply in the same chat (HTML)."""
+    async def say(self, u_or_msg, text, markup=None, effect=None, **kw):
+        """Send to the same chat. `text` may be a rich.Doc (RTL rich message) or a classic HTML string."""
         m = u_or_msg.effective_message if isinstance(u_or_msg, Update) else u_or_msg
-        return await m.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup, **kw)
+        if isinstance(text, Doc):
+            return await R.send(m.get_bot(), m.chat_id, text, markup, effect)
+        return await m.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup, message_effect_id=effect, **kw)
 
     async def show(self, q, text, markup=None):
         """Edit the message the inline button belongs to (one living screen instead of a stream of messages);
-        falls back to a new message if it can't be edited (too old / not ours / not modified)."""
+        falls back to a new message if it can't be edited (too old / not ours)."""
+        return await self.screen(q.message, text, markup)
+
+    async def screen(self, msg, text, markup=None):
+        """Edit `msg` in place with `text` (rich.Doc or classic HTML); new message if editing is impossible."""
         try:
-            return await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            if isinstance(text, Doc):
+                r = await R.edit(msg.get_bot(), msg.chat_id, msg.message_id, text, markup)
+                return r if r not in (None, True) else msg
+            return await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as ex:  # noqa: BLE001
             if "not modified" in str(ex).lower():
-                return q.message
-            return await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                return msg
+            log.info("edit failed (%s) -> new message", str(ex)[:80])
+            return await self.say(msg, text, markup)
 
     async def alert(self, q, text, show_alert=False):
         await self.safe_answer(q, text[:190], show_alert=show_alert)
 
     def progress_card(self, uid):
-        """Onboarding checklist: subscription -> wallet -> API key -> link."""
+        """Onboarding checklist: subscription -> wallet -> API key -> link. -> (done_count, [(bool, html)])"""
         usr = self.db.user(uid)
         sub = bool(usr) and self.db.is_subscribed(uid)
         wal = bool(self.db.wallets(uid))
         key = bool(self.db.apikeys(uid, valid_after=time.time()))
-        step = lambda ok, txt: f"{e('ok') if ok else e('timer')} {txt}"
-        done = sum((sub, wal, key))
-        lines = [step(sub, "اشتراک" + (f" — تا {when(usr['sub_until'], rel=False)}" if sub else "")),
-                 step(wal, "ثبت ولت burner"), step(key, "کلید API شخصی OpenSea"),
-                 step(False, "ارسال لینک کالکشن و مسلح کردن")]
-        return done, f"{ui.bar(done, 3, 9)}  {done}/3\n" + "\n".join(lines)
+        items = [(sub, "<b>اشتراک</b>" + (f" — فعال تا {R.tm(usr['sub_until'], 'D')}" if sub else " — هنوز فعال نشده")),
+                 (wal, "<b>ولت burner</b> — یک ولت جداگانه برای مینت"),
+                 (key, f"<b>کلید {lt('API')} شخصی</b> {lt('OpenSea')}"),
+                 (False, "<b>لینک کالکشن</b> را بفرستید و برنامه را مسلح کنید")]
+        return sum((sub, wal, key)), items
 
     async def blocking(self, f, *a):
         return await asyncio.get_running_loop().run_in_executor(None, f, *a)
@@ -164,16 +178,16 @@ class Service:
         usr = u.effective_user
         self.db.ensure_user(usr.id, usr.username)
         c.user_data.clear()
-        done, card = self.progress_card(usr.id)
+        done, items = self.progress_card(usr.id)
         name = esc(usr.first_name or "دوست عزیز")
-        txt = (f"{e('robot')} <b>سلام {name}، به Ray Minter خوش آمدید</b>\n"
-               "مینت خودکار و فوق‌سریع دراپ‌های OpenSea روی <b>Robinhood Chain</b> — Allowlist و Public، "
-               "چند مرحله با تعداد دلخواه، دقیقاً در لحظهٔ شروع.\n\n"
-               f"{e('bolt')} شلیک در همان ثانیهٔ شروع مرحله\n"
-               f"{e('shield')} کلید ولت رمزنگاری‌شده و بدون هیچ پرداخت اضافه\n"
-               f"{e('chart')} گزارش سرعت و رتبه بعد از هر مینت\n\n"
-               f"{title('list', 'شروع کار')}\n{card}")
-        await self.say(u, txt, self.menu())
+        d = (Doc().h(f"سلام {name}، خوش آمدید", "robot", 2)
+             .p(f"<b>{lt('Ray Minter')}</b> دراپ‌های {lt('OpenSea')} روی شبکهٔ <b>{lt('Robinhood Chain')}</b> را "
+                "دقیقاً در لحظهٔ شروع، خودکار و با بیشترین سرعت برای ولت شما مینت می‌کند.")
+             .ul([f"{e('bolt')} <b>شلیک در همان ثانیهٔ شروع</b> هر مرحله ({lt('Allowlist')} و {lt('Public')})",
+                  f"{e('list')} <b>چند مرحله، تعداد دلخواه</b> برای هر مرحله، با یک ولت",
+                  f"{e('shield')} <b>امن:</b> کلید ولت رمزنگاری‌شده؛ هرگز بیشتر از سقف و قیمت تأییدشدهٔ شما خرج نمی‌شود",
+                  f"{e('chart')} <b>گزارش سرعت و رتبه</b> بعد از هر مینت"])
+             .hr().h(f"شروع کار — {ltr(f'{done}/3')}", "list", 3).checklist(items))
         nxt = None
         if not self.db.is_subscribed(usr.id):
             nxt = btn(f"خرید اشتراک {self.cfg.sub_days} روزه — {self.cfg.price_stars} ⭐", "buy", style="success", icon="pstar")
@@ -181,56 +195,69 @@ class Service:
             nxt = btn("افزودن ولت", "wadd", style="success", icon="plus")
         elif not self.db.apikeys(usr.id, valid_after=time.time()):
             nxt = btn("افزودن کلید API", "kset", style="success", icon="plus")
-        if nxt:
-            await self.say(u, f"{e('next')} <b>قدم بعدی:</b>", kb([nxt]))
+        else:
+            nxt = btn("تسک جدید", "nt", style="primary", icon="bolt")
+        d.footer(f"{lt('Ray Minter')} · {lt('Robinhood Chain')} · راهنما: /help")
+        await self.say(u, d, self.menu())
+        await self.say(u, Doc().p(f"{e('next')} <b>قدم بعدی</b>"), kb([nxt]))
 
     async def help(self, u: Update, c):
-        txt = (f"{title('info', 'راهنمای Ray Minter')}\n\n"
-               f"<b>{e('next')} چطور کار می‌کند</b>\n"
-               "۱. لینک کالکشن را بفرستید ← ۲. ولت را انتخاب کنید ← ۳. مرحله‌ها و تعداد هرکدام را بزنید ← "
-               "۴. «مسلح کردن». ربات در لحظهٔ شروع هر مرحله شلیک می‌کند و نتیجه را همین‌جا گزارش می‌دهد.\n\n"
-               f"<b>{e('pin')} نکات مهم</b>\n"
-               + ui.quote(
-                   "• دراپ‌های SeaDrop روی Robinhood Chain: مراحل Allowlist (امضادار) و Public، رایگان یا پولی.\n"
-                   "• قبل از ثبت، allowlist و سقف هر مرحله برای همان ولت از OpenSea (ورود SIWE) چک می‌شود.\n"
-                   "• سقف هر ولت (Limit N per wallet) <b>جدا برای هر مرحله</b> است؛ مثلاً Limit 4 در مرحلهٔ اول و "
-                   "Limit 1 در مرحلهٔ دوم یعنی جمعاً ۵ عدد.\n"
-                   "• ربات هرگز بیشتر از سقف، عرضه یا قیمت قابل‌قبول شما ارسال نمی‌کند.", expandable=True) + "\n"
-               f"<b>{e('gear')} امکانات</b>\n"
-               + ui.quote(
-                   "• واکنش به تغییر قیمت در «⚙️ تنظیمات» (فقط همان قیمت / کمتر شد / تا سقف ٪ / هر تغییری تا سقف ٪).\n"
-                   "• چند کلید API: هر مرحلهٔ هم‌زمان کلید اختصاصی می‌گیرد تا سهمیهٔ OpenSea تقسیم نشود.\n"
-                   "• گزارش سرعت (امضا، ارسال، تأیید) و رتبهٔ شما بین مینت‌کننده‌ها بعد از هر مینت.\n"
-                   "• کلیدهای فوری OpenSea ۷ روزه‌اند؛ ربات قبل از انقضا هشدار می‌دهد.", expandable=True) + "\n"
-               f"<b>{e('shield')} امنیت</b>\n"
-               + ui.quote(
-                   "• فقط یک ولت جداگانه (burner) با کمی ETH بسازید و NFT را بعد از مینت منتقل کنید.\n"
-                   "• کلید خصوصی بلافاصله از چت پاک و با AES-256-GCM رمزنگاری می‌شود.\n"
-                   "• هرگز کلید ولت اصلی خود را وارد نکنید.") + "\n"
-               "<b>دستورات:</b> /start · /cancel · /wallets · /key · /tasks · /sub · /settings")
-        await self.say(u, txt)
+        d = (Doc().h("راهنمای Ray Minter", "info", 2)
+             .h("چطور کار می‌کند", "next", 3)
+             .ol([f"لینک کالکشن {lt('OpenSea')} را بفرستید (یا «🎯 تسک جدید»).",
+                  "ولتی را که با آن مینت می‌کنید انتخاب کنید.",
+                  "مرحله‌ها و تعداد هرکدام را مشخص کنید.",
+                  "«تأیید و مسلح کردن» — ربات در لحظهٔ شروع هر مرحله شلیک می‌کند و نتیجه را همین‌جا می‌فرستد."])
+             .hr()
+             .details(f"{e('pin')} نکات مهم دربارهٔ مرحله‌ها و سقف", "<ul>"
+                      f"<li>دراپ‌های {lt('SeaDrop')} روی {lt('Robinhood Chain')}: مرحله‌های {lt('Allowlist')} (امضادار) و {lt('Public')}، رایگان یا پولی.</li>"
+                      f"<li>قبل از ثبت، {lt('allowlist')} و سقف هر مرحله برای همان ولت از {lt('OpenSea')} (ورود {lt('SIWE')}) چک می‌شود.</li>"
+                      f"<li>سقف هر ولت ({lt('Limit N per wallet')}) <b>جدا برای هر مرحله</b> است؛ مثلاً {lt('Limit 4')} در مرحلهٔ اول و "
+                      f"{lt('Limit 1')} در مرحلهٔ دوم یعنی جمعاً ۵ عدد.</li>"
+                      "<li>ربات هرگز بیشتر از سقف، عرضه یا قیمت قابل‌قبول شما ارسال نمی‌کند.</li></ul>")
+             .details(f"{e('gear')} امکانات", "<ul>"
+                      "<li><b>واکنش به تغییر قیمت</b> در «⚙️ تنظیمات»: فقط همان قیمت / کمتر شد / تا سقف ٪ / هر تغییری تا سقف ٪.</li>"
+                      f"<li><b>چند کلید {lt('API')}</b>: هر مرحلهٔ هم‌زمان کلید اختصاصی می‌گیرد تا سهمیهٔ {lt('OpenSea')} تقسیم نشود.</li>"
+                      "<li><b>گزارش سرعت</b> (امضا، ارسال، تأیید) و <b>رتبهٔ شما</b> بین مینت‌کننده‌ها بعد از هر مینت.</li>"
+                      "<li>کلیدهای فوری OpenSea ۷ روزه‌اند؛ ربات قبل از انقضا هشدار می‌دهد.</li></ul>")
+             .details(f"{e('shield')} امنیت", "<ul>"
+                      "<li>فقط یک <b>ولت جداگانه (burner)</b> با کمی ETH بسازید و NFT را بعد از مینت منتقل کنید.</li>"
+                      f"<li>کلید خصوصی بلافاصله از چت پاک و با {lt('AES-256-GCM')} رمزنگاری می‌شود.</li>"
+                      "<li><b>هرگز کلید ولت اصلی خود را وارد نکنید.</b></li></ul>", open_=True)
+             .hr()
+             .table(["دستور", "کار"], [[lt("/new"), "تسک مینت جدید"], [lt("/tasks"), "تسک‌های من"],
+                                       [lt("/wallets"), "ولت‌ها"], [lt("/key"), f"کلیدهای {lt('API')}"],
+                                       [lt("/settings"), "تنظیمات"], [lt("/sub"), "اشتراک"], [lt("/cancel"), "لغو کار فعلی"]],
+                    caption="دستورات"))
+        await self.say(u, d)
 
     async def cancel_cmd(self, u: Update, c):
         c.user_data.clear()
-        await self.say(u, f"{e('stop')} لغو شد. هر وقت خواستید از منو ادامه دهید.", self.menu())
+        await self.say(u, Doc().p(f"{e('stop')} <b>لغو شد.</b> هر وقت خواستید از منو ادامه دهید."), self.menu())
 
     # ------------------------------------------------------------------ subscription
     async def sub(self, u: Update, c):
         usr = self.db.ensure_user(u.effective_user.id, u.effective_user.username)
+        plan = [("مدت", f"{self.cfg.sub_days} روز"), ("قیمت", f"{ltr(self.cfg.price_stars)} ⭐ {lt('Telegram Stars')}"),
+                ("تسک فعال هم‌زمان", f"تا {ltr(self.max_active())}"), ("ولت", "تا ۵ ولت")]
         if self.db.is_subscribed(usr["id"]):
             left = max(0, usr["sub_until"] - time.time()) / 86400
-            s = (f"{title('gem', 'اشتراک شما')}\n\n{e('green')} <b>فعال</b> — {left:.1f} روز باقی‌مانده\n"
-                 f"{ui.kv('پایان', fmt_ts(usr['sub_until']))}\n\n"
-                 f"تمدید، {self.cfg.sub_days} روز به انتهای اشتراک فعلی اضافه می‌کند.")
+            d = (Doc().h("اشتراک شما", "gem", 2)
+                 .kv([("وضعیت", f"{e('green')} <b>فعال</b>"), ("باقی‌مانده", f"{ltr(f'{left:.1f}')} روز"),
+                      ("پایان", R.when(usr["sub_until"]))])
+                 .note(f"تمدید، {self.cfg.sub_days} روز به <b>انتهای</b> اشتراک فعلی اضافه می‌کند.", "idea"))
             label = f"تمدید {self.cfg.sub_days} روزه — {self.cfg.price_stars} ⭐"
         else:
-            s = (f"{title('gem', 'اشتراک Ray Minter')}\n\n{e('red')} اشتراک فعال ندارید.\n\n"
-                 f"{e('ok')} مینت خودکار Allowlist و Public، چند مرحله و چند ولت\n"
-                 f"{e('ok')} گزارش سرعت و رتبه بعد از هر مینت\n"
-                 f"{e('ok')} تا {self.max_active()} تسک فعال هم‌زمان\n\n"
-                 f"{ui.kv('مدت', f'{self.cfg.sub_days} روز')} · {ui.kv('قیمت', f'{self.cfg.price_stars} ⭐ Telegram Stars')}")
+            d = (Doc().h(f"اشتراک {lt('Ray Minter')}", "gem", 2)
+                 .p(f"{e('red')} اشتراک فعال ندارید.")
+                 .checklist([(True, f"مینت خودکار {lt('Allowlist')} و {lt('Public')}، چند مرحله و چند ولت"),
+                             (True, "شلیک در همان ثانیهٔ شروع هر مرحله"),
+                             (True, "گزارش سرعت و رتبه بعد از هر مینت"),
+                             (True, "واکنش هوشمند به تغییر قیمت")])
+                 .kv(plan, caption="پلن")
+                 .footer(f"پرداخت امن داخل تلگرام با {lt('Telegram Stars')}"))
             label = f"خرید اشتراک {self.cfg.sub_days} روزه — {self.cfg.price_stars} ⭐"
-        await self.say(u, s, kb([btn(label, "buy", style="success", icon="pstar")]))
+        await self.say(u, d, kb([btn(label, "buy", style="success", icon="pstar")]))
 
     async def buy(self, u: Update, c):
         q = u.callback_query
@@ -257,30 +284,33 @@ class Service:
         new = self.db.record_payment(p.telegram_payment_charge_id, uid, p.total_amount, p.invoice_payload, days)
         self.db.audit(uid, "payment", f"{p.total_amount} XTR {p.telegram_payment_charge_id}")
         if new:
-            await u.message.reply_text(
-                f"{e('party')} <b>پرداخت موفق — خوش آمدید!</b>\n\n{e('gem')} اشتراک فعال تا {fmt_ts(new)}\n\n"
-                f"{e('next')} قدم بعدی: ولت burner و کلید API را ثبت کنید، بعد لینک کالکشن را بفرستید.",
-                parse_mode=ParseMode.HTML, reply_markup=self.menu(), message_effect_id=ui.EFFECT_PARTY)
+            d = (Doc().h("پرداخت موفق — خوش آمدید!", "party", 2)
+                 .kv([("اشتراک", f"{e('green')} فعال"), ("تا", R.when(new)), ("مبلغ", f"{ltr(p.total_amount)} ⭐")])
+                 .p(f"{e('next')} <b>قدم بعدی:</b> ولت burner و کلید {lt('API')} را ثبت کنید، بعد لینک کالکشن را بفرستید."))
+            await self.say(u, d, self.menu(), effect=ui.EFFECT_PARTY)
 
     def need_sub(self, uid):
-        return None if self.db.is_subscribed(uid) else f"{e('lock')} برای این بخش اشتراک فعال لازم است (💳 اشتراک)."
+        return None if self.db.is_subscribed(uid) else \
+            Doc().p(f"{e('lock')} <b>برای این بخش اشتراک فعال لازم است.</b>").p("از دکمهٔ زیر یا «💳 اشتراک» اقدام کنید.")
 
     # ------------------------------------------------------------------ wallets
     def wallets_view(self, uid):
         ws = self.db.wallets(uid)
-        lines = [f"{title('coin', 'ولت‌های شما')}  <i>({len(ws)} از ۵)</i>\n"]
-        for n, w in enumerate(ws, 1):
-            busy = self.db.q("SELECT COUNT(*) FROM tasks WHERE wallet_id=? AND status IN ('scheduled','running')", (w["id"],))[0][0]
-            lines.append(f"<b>{n}.</b> {ui.code(w['address'])}"
-                         + (f"\n     {e('bolt')} {busy} تسک فعال" if busy else ""))
-        if not ws:
-            lines.append(f"{e('info')} هنوز ولتی ثبت نکرده‌اید.\n")
-        lines.append("\n" + ui.quote(f"{e('shield')} فقط ولت جداگانه (burner) با کمی ETH برای گس — هرگز ولت اصلی."))
-        rows = [[btn(f"{ui.short(w['address'])}", copy=w["address"], icon="link"),
+        d = Doc().h(f"ولت‌های شما — {ltr(f'{len(ws)}/5')}", "coin", 2)
+        if ws:
+            rows = []
+            for n, w in enumerate(ws, 1):
+                busy = self.db.q("SELECT COUNT(*) FROM tasks WHERE wallet_id=? AND status IN ('scheduled','running')", (w["id"],))[0][0]
+                rows.append([ltr(n), mono(w["address"]), f"{e('bolt')} {ltr(busy)}" if busy else "—"])
+            d.table(["#", "آدرس", "تسک فعال"], rows, align=["center", "left", "center"])
+        else:
+            d.p(f"{e('info')} هنوز ولتی ثبت نکرده‌اید. با دکمهٔ «افزودن ولت» شروع کنید.")
+        d.note(f"فقط <b>ولت جداگانه (burner)</b> با کمی {lt('ETH')} برای گس — <b>هرگز ولت اصلی</b>.", "shield")
+        rows = [[btn(ui.short(w["address"]), copy=w["address"], icon="link"),
                  btn("حذف", f"wdq:{w['id']}", style="danger", icon="trash")] for w in ws]
         if len(ws) < 5:
             rows.append([btn("افزودن ولت", "wadd", style="success", icon="plus")])
-        return "\n".join(lines), kb(*rows)
+        return d, kb(*rows)
 
     async def wallets(self, u: Update, c):
         uid = u.effective_user.id
@@ -294,8 +324,8 @@ class Service:
         w = self.db.wallet(q.from_user.id, int(q.data.split(":")[1]))
         if not w:
             return await self.show(q, *self.wallets_view(q.from_user.id))
-        await self.show(q, f"{e('warn')} <b>حذف این ولت؟</b>\n{ui.code(w['address'])}\n\n"
-                           "کلید رمزنگاری‌شدهٔ آن از ربات پاک می‌شود (دارایی ولت دست نمی‌خورد).",
+        await self.show(q, Doc().h("حذف این ولت؟", "warn", 3).p(mono(w["address"]))
+                        .p("کلید رمزنگاری‌شدهٔ آن از ربات پاک می‌شود. <b>دارایی ولت دست نمی‌خورد.</b>"),
                         kb([btn("بله، حذف کن", f"wdel:{w['id']}", style="danger", icon="trash"),
                             btn("نه، برگرد", "wls", icon="next")]))
 
@@ -313,10 +343,12 @@ class Service:
             return await self.alert(q, "حداکثر ۵ ولت مجاز است.", True)
         c.user_data["state"] = "await_pk"
         await self.say(q.message,
-                       f"{title('lock', 'افزودن ولت burner')}\n\n"
-                       "کلید خصوصی (Private Key) ولت را بفرستید — ۶۴ کاراکتر hex (با یا بدون 0x).\n\n"
-                       f"{e('warn')} <b>فقط ولت جداگانه با کمی ETH برای گس — نه ولت اصلی!</b>\n"
-                       f"{e('shield')} پیام شما همان لحظه پاک و کلید با AES-256-GCM رمزنگاری می‌شود.",
+                       Doc().h("افزودن ولت burner", "lock", 3)
+                       .p(f"کلید خصوصی ({lt('Private Key')}) ولت را بفرستید — {ltr('64')} کاراکتر {lt('hex')}، با یا بدون {lt('0x')}.")
+                       .checklist([(True, "پیام شما <b>همان لحظه پاک</b> می‌شود"),
+                                   (True, f"کلید با {lt('AES-256-GCM')} رمزنگاری و ذخیره می‌شود"),
+                                   (True, "فقط برای امضای تراکنش مینت استفاده می‌شود")])
+                       .note("<b>فقط ولت جداگانه با کمی ETH برای گس — نه ولت اصلی!</b>", "warn"),
                        kb([btn("انصراف", "xc", style="danger", icon="no")]))
 
     async def wallet_del(self, u: Update, c):
@@ -327,8 +359,8 @@ class Service:
         self.db.audit(q.from_user.id, "wallet_delete", f"{wid} {ok}")
         if not ok:
             await self.alert(q, "این ولت تسک فعال دارد؛ اول تسک را لغو کنید.", True)
-        txt, mk = self.wallets_view(q.from_user.id)
-        await self.show(q, (f"{e('ok')} ولت حذف شد.\n\n" if ok else "") + txt, mk)
+        d, mk = self.wallets_view(q.from_user.id)
+        await self.show(q, (Doc().p(f"{e('ok')} <b>ولت حذف شد.</b>").extend(d) if ok else d), mk)
 
     async def got_pk(self, u: Update, c):
         uid = u.effective_user.id
@@ -336,56 +368,59 @@ class Service:
         try:
             await u.message.delete()
         except Exception:  # noqa: BLE001
-            await u.effective_chat.send_message(f"{e('warn')} نتوانستم پیام را پاک کنم؛ <b>لطفاً همین الان خودتان آن را پاک کنید.</b>",
-                                                parse_mode=ParseMode.HTML)
-        send = lambda t, mk=None: u.effective_chat.send_message(t, parse_mode=ParseMode.HTML, reply_markup=mk)
+            await R.send(u.get_bot(), uid, Doc().p(f"{e('siren')} نتوانستم پیام را پاک کنم؛ <b>لطفاً همین الان خودتان آن را پاک کنید.</b>"))
+        send = lambda d, mk=None: R.send(u.get_bot(), uid, d, mk)
         try:
             pk = normalize_private_key(text)
         except Exception:  # noqa: BLE001
-            return await send(f"{e('no')} کلید معتبر نیست (۶۴ کاراکتر hex). دوباره بفرستید یا انصراف بزنید.",
+            return await send(Doc().p(f"{e('no')} <b>کلید معتبر نیست.</b> باید {ltr('64')} کاراکتر {lt('hex')} باشد. دوباره بفرستید یا انصراف بزنید."),
                               kb([btn("انصراف", "xc", style="danger", icon="no")]))
         addr, blob = self.vault.encrypt(uid, pk)
         try:
             bal = await self.blocking(pf.check_wallet, addr)
         except pf.PreflightError as ex:
-            return await send(f"{e('no')} {esc(ex)}")
+            return await send(Doc().p(f"{e('no')} {esc(ex)}"))
         self.db.add_wallet(uid, addr, blob)
         self.db.audit(uid, "wallet_add", addr)
         c.user_data.pop("state", None)
-        warn = "" if bal >= pf.WARN_BALANCE_WEI else \
-            f"\n\n{e('warn')} موجودی برای گس کم است؛ حداقل <b>0.0001 ETH</b> روی Robinhood Chain واریز کنید."
-        await send(f"{e('ok')} <b>ولت ثبت شد</b>\n{ui.code(addr)}\n{ui.kv('موجودی', ui.eth(bal))}{warn}",
-                   kb([btn("کپی آدرس", copy=addr, icon="link"), btn("اکسپلورر", url=ui.addr_url(addr), icon="search")]))
-        await send(f"{e('lock')} کلید خصوصی پاک و رمزنگاری شد.", self.menu())
+        d = (Doc().h("ولت ثبت شد", "ok", 3)
+             .kv([("آدرس", mono(addr)), ("موجودی", R.eth(bal)), ("شبکه", lt("Robinhood Chain"))]))
+        if bal < pf.WARN_BALANCE_WEI:
+            d.note(f"موجودی برای گس کم است؛ حداقل <b>{lt('0.0001 ETH')}</b> روی {lt('Robinhood Chain')} واریز کنید.", "warn")
+        d.footer(f"{e('lock')} کلید خصوصی پاک و رمزنگاری شد.")
+        await send(d, kb([btn("کپی آدرس", copy=addr, icon="link"), btn("اکسپلورر", url=ui.addr_url(addr), icon="search")]))
+        await send(Doc().p(f"{e('next')} حالا لینک کالکشن را بفرستید یا از منو ادامه دهید."), self.menu())
 
     # ------------------------------------------------------------------ OpenSea API key
     def key_menu(self, uid):
         ks = self.db.apikeys(uid)
         now = time.time()
         valid = sum(1 for k in ks if not (k["expires_at"] and k["expires_at"] < now))
-        lines = [f"{title('lock', 'کلیدهای API شخصی OpenSea')}  <i>({valid} معتبر از {len(ks)})</i>\n"]
-        if not ks:
-            lines.append(f"{e('red')} هنوز کلیدی ثبت نشده — برای مینت حداقل یک کلید لازم است.\n")
+        d = Doc().h(f"کلیدهای {lt('API')} شخصی {lt('OpenSea')}", "lock", 2)
         src = {"instant": "فوری", "manual": "دستی", "legacy": "قدیمی"}
-        for n, k in enumerate(ks, 1):
-            busy = self.db.q("SELECT COUNT(*) FROM tasks WHERE apikey_id=? AND status IN ('scheduled','running')", (k["id"],))[0][0]
-            dead = k["expires_at"] and k["expires_at"] < now
-            soon = not dead and k["expires_at"] and k["expires_at"] - now < 86400
-            st = e("red") if dead else (e("warn") if soon else e("green"))
-            lines.append(f"{st} <b>کلید {esc(k['label'] or k['id'])}</b> · {src.get(k['source'], esc(k['source']))}"
-                         + (f" · {e('bolt')} {busy} تسک" if busy else "") + "\n     "
-                         + ("منقضی شده" if dead else (f"انقضا {fmt_ts(k['expires_at'])}" if k["expires_at"] else "انقضا: نامشخص")))
-        lines.append("\n" + ui.quote(
-            f"{e('idea')} هر مرحله کلید اختصاصی خودش را می‌گیرد تا سهمیهٔ ۵ درخواست مینت OpenSea بین مرحله‌های "
-            "هم‌زمان تقسیم نشود.\n"
-            f"{e('warn')} کلیدهای یک حساب OpenSea سهمیهٔ مشترک دارند و کلید فوری روزانه ۲ عدد برای هر IP است؛ "
-            "کلیدها را از اینترنت/حساب‌های مختلف بسازید.\n\n"
-            "<b>روش ۱:</b> دکمهٔ «⚡ ساخت خودکار کلید API» در منو (از اینترنت خود شما).\n"
-            "<b>روش ۲:</b> <code>curl -X POST https://api.opensea.io/api/v2/auth/keys</code> یا کلید کامل از "
-            "opensea.io/settings/developer و ارسال همین‌جا.", expandable=True))
+        if ks:
+            rows = []
+            for k in ks:
+                busy = self.db.q("SELECT COUNT(*) FROM tasks WHERE apikey_id=? AND status IN ('scheduled','running')", (k["id"],))[0][0]
+                dead = k["expires_at"] and k["expires_at"] < now
+                soon = not dead and k["expires_at"] and k["expires_at"] - now < 86400
+                st = (f"{e('red')} منقضی" if dead else f"{e('warn')} رو به انقضا" if soon else f"{e('green')} معتبر")
+                exp = "—" if not k["expires_at"] else (R.tm(k["expires_at"], "d") if dead else R.rel(k["expires_at"]))
+                rows.append([lt(k["label"] or k["id"]), st, src.get(k["source"], esc(k["source"])), exp, ltr(busy) if busy else "—"])
+            d.table(["کلید", "وضعیت", "نوع", "انقضا", "تسک"], rows, caption=f"{ltr(valid)} معتبر از {ltr(len(ks))}",
+                    align=["center", "right", "right", "right", "center"])
+        else:
+            d.p(f"{e('red')} <b>هنوز کلیدی ثبت نشده</b> — برای مینت حداقل یک کلید لازم است.")
+        d.details(f"{e('idea')} چرا چند کلید؟ و چطور کلید بسازم؟",
+                  f"<p>هر مرحله کلید اختصاصی خودش را می‌گیرد تا سهمیهٔ <b>۵ درخواست مینت</b> {lt('OpenSea')} بین مرحله‌های هم‌زمان تقسیم نشود.</p>"
+                  f"<p>{e('warn')} کلیدهای یک حساب {lt('OpenSea')} سهمیهٔ مشترک دارند و کلید فوری روزانه ۲ عدد برای هر {lt('IP')} است؛ "
+                  "کلیدها را از اینترنت یا حساب‌های مختلف بسازید.</p>"
+                  "<ol><li><b>خودکار:</b> دکمهٔ «⚡ ساخت خودکار کلید API» در منو (از اینترنت خود شما).</li>"
+                  f"<li><b>دستی:</b> <code>{ltr('curl -X POST https://api.opensea.io/api/v2/auth/keys')}</code> یا کلید کامل از "
+                  f"{lt('opensea.io/settings/developer')} و ارسال همین‌جا.</li></ol>", open_=not ks)
         rows = [[btn(f"حذف کلید {k['label'] or k['id']}", f"kdq:{k['id']}", style="danger", icon="trash")] for k in ks]
         rows.append([btn("افزودن کلید (دستی)", "kset", style="success", icon="plus")])
-        return "\n".join(lines), kb(*rows)
+        return d, kb(*rows)
 
     async def key(self, u: Update, c):
         uid = u.effective_user.id
@@ -400,8 +435,8 @@ class Service:
         k = self.db.apikey_by_id(q.from_user.id, kid)
         if not k:
             return await self.show(q, *self.key_menu(q.from_user.id))
-        await self.show(q, f"{e('warn')} <b>حذف کلید {esc(k['label'] or k['id'])}؟</b>\n"
-                           "تسک‌هایی که بعداً شروع می‌شوند از کلیدهای دیگر شما استفاده می‌کنند.",
+        await self.show(q, Doc().h(f"حذف کلید {lt(k['label'] or k['id'])}؟", "warn", 3)
+                        .p("تسک‌هایی که بعداً شروع می‌شوند از کلیدهای دیگر شما استفاده می‌کنند."),
                         kb([btn("بله، حذف کن", f"kdel:{kid}", style="danger", icon="trash"),
                             btn("نه، برگرد", "kls", icon="next")]))
 
@@ -418,40 +453,41 @@ class Service:
         self.db.audit(q.from_user.id, "apikey_delete", f"{kid} {ok}")
         if not ok:
             await self.alert(q, "این کلید به تسک فعال اختصاص دارد؛ اول تسک را لغو کنید.", True)
-        txt, mk = self.key_menu(q.from_user.id)
-        await self.show(q, (f"{e('ok')} کلید حذف شد.\n\n" if ok else "") + txt, mk)
+        d, mk = self.key_menu(q.from_user.id)
+        await self.show(q, (Doc().p(f"{e('ok')} <b>کلید حذف شد.</b>").extend(d) if ok else d), mk)
 
     async def key_set(self, u: Update, c):
         q = u.callback_query
         await self.safe_answer(q)
         c.user_data["state"] = "await_key"
-        await self.say(q.message, f"{title('lock', 'افزودن کلید API')}\n\nکلید API یا <b>کل خروجی JSON</b> دستور curl را بفرستید.\n"
-                                  f"{e('shield')} پیام شما بعد از دریافت پاک می‌شود.",
+        await self.say(q.message, Doc().h(f"افزودن کلید {lt('API')}", "lock", 3)
+                       .p(f"کلید {lt('API')} یا <b>کل خروجی {lt('JSON')}</b> دستور {lt('curl')} را بفرستید.")
+                       .footer(f"{e('shield')} پیام شما بعد از دریافت پاک می‌شود."),
                        kb([btn("انصراف", "xc", style="danger", icon="no")]))
 
     async def store_key(self, u: Update, c, key, expires_at, source):
         uid = u.effective_user.id
+        send = lambda d, mk=None: R.send(u.get_bot(), uid, d, mk)
         try:
             ok, why = await self.blocking(self.os.test_key, key)
         except OpenSeaError as ex:
-            return await u.effective_chat.send_message(f"{e('warn')} تست کلید ممکن نشد: {esc(ex)}. بعداً دوباره امتحان کنید.",
-                                                       parse_mode=ParseMode.HTML)
+            return await send(Doc().p(f"{e('warn')} تست کلید ممکن نشد: {lt(ex)}").p("بعداً دوباره امتحان کنید."))
         if not ok:
-            return await u.effective_chat.send_message(f"{e('no')} کلید توسط OpenSea رد شد: {esc(why)}", parse_mode=ParseMode.HTML)
+            return await send(Doc().p(f"{e('no')} <b>کلید توسط {lt('OpenSea')} رد شد:</b> {lt(why)}"))
         import hashlib
         fp = hashlib.sha256(("osh-key|" + key).encode()).hexdigest()[:32]
         r = self.db.add_apikey(uid, self.vault.seal(uid, "apikey", key), expires_at, source, fp)
         c.user_data.pop("state", None)
-        H = ParseMode.HTML
         if r == "dup":
-            return await u.effective_chat.send_message(f"{e('info')} این کلید قبلاً ثبت شده است.", parse_mode=H, reply_markup=self.menu())
+            return await send(Doc().p(f"{e('info')} این کلید قبلاً ثبت شده است."), self.menu())
         if r == "full":
-            return await u.effective_chat.send_message(f"{e('no')} حداکثر {self.db.MAX_KEYS} کلید مجاز است؛ یکی را حذف کنید.", parse_mode=H)
+            return await send(Doc().p(f"{e('no')} حداکثر {ltr(self.db.MAX_KEYS)} کلید مجاز است؛ یکی را حذف کنید."))
         self.db.audit(uid, "apikey_add", f"{r} {source}")
-        exp = f"\n{ui.kv('انقضا', fmt_ts(expires_at))}" if expires_at else ""
         n = len(self.db.apikeys(uid, valid_after=time.time()))
-        await u.effective_chat.send_message(f"{e('ok')} <b>کلید API تست و ذخیره شد.</b> (کلیدهای معتبر شما: {n})" + exp,
-                                            parse_mode=H, reply_markup=self.menu())
+        await send(Doc().h(f"کلید {lt('API')} تست و ذخیره شد", "ok", 3)
+                   .kv([("نوع", "فوری" if source == "instant" else "دستی"),
+                        ("انقضا", R.when(expires_at) if expires_at else "نامشخص"), ("کلیدهای معتبر شما", ltr(n))]),
+                   self.menu())
 
     @staticmethod
     def parse_key_text(text):
@@ -479,18 +515,20 @@ class Service:
         except Exception:  # noqa: BLE001
             pass
         if key and key.startswith("ERR:"):
-            return await u.effective_chat.send_message(f"{e('no')} OpenSea خطا داد: {esc(key[4:])}\n<i>سقف ساخت کلید فوری ۲ عدد در روز برای هر IP است.</i>", parse_mode=ParseMode.HTML)
+            return await self.say(u, Doc().p(f"{e('no')} <b>{lt('OpenSea')} خطا داد:</b> {lt(key[4:])}")
+                                  .footer(f"سقف ساخت کلید فوری ۲ عدد در روز برای هر {lt('IP')} است."))
         if not key:
-            return await u.effective_chat.send_message(f"{e('no')} کلید پیدا نشد. دوباره بفرستید یا /cancel", parse_mode=ParseMode.HTML)
+            return await self.say(u, Doc().p(f"{e('no')} کلید پیدا نشد. دوباره بفرستید یا {lt('/cancel')}"))
         await self.store_key(u, c, key, exp or int(time.time()) + 7 * 86400, "manual")
 
     async def webapp_data(self, u: Update, c):
         data = u.effective_message.web_app_data.data
         key, exp = self.parse_key_text(data)
         if key and key.startswith("ERR:"):
-            return await u.effective_chat.send_message(f"{e('no')} OpenSea خطا داد: {esc(key[4:])}\n<i>سقف ساخت کلید فوری ۲ عدد در روز برای هر IP است.</i>", parse_mode=ParseMode.HTML)
+            return await self.say(u, Doc().p(f"{e('no')} <b>{lt('OpenSea')} خطا داد:</b> {lt(key[4:])}")
+                                  .footer(f"سقف ساخت کلید فوری ۲ عدد در روز برای هر {lt('IP')} است."))
         if not key:
-            return await u.effective_chat.send_message(f"{e('no')} داده نامعتبر از صفحهٔ ساخت کلید", parse_mode=ParseMode.HTML)
+            return await self.say(u, Doc().p(f"{e('no')} داده نامعتبر از صفحهٔ ساخت کلید"))
         await self.store_key(u, c, key, exp or int(time.time()) + 7 * 86400, "instant")
 
     # ------------------------------------------------------------------ tasks
@@ -500,16 +538,19 @@ class Service:
         if (m := self.need_sub(uid)):
             return await self.say(u, m, kb([btn(f"خرید اشتراک — {self.cfg.price_stars} ⭐", "buy", style="success", icon="pstar")]))
         if not self.db.apikey(uid):
-            return await self.say(u, f"{e('lock')} اول کلید API شخصی OpenSea را ثبت کنید.",
+            return await self.say(u, Doc().p(f"{e('lock')} اول کلید {lt('API')} شخصی {lt('OpenSea')} را ثبت کنید."),
                                   kb([btn("افزودن کلید API", "kset", style="success", icon="plus")]))
         if not self.db.wallets(uid):
-            return await self.say(u, f"{e('coin')} اول یک ولت burner ثبت کنید.",
+            return await self.say(u, Doc().p(f"{e('coin')} اول یک ولت burner ثبت کنید."),
                                   kb([btn("افزودن ولت", "wadd", style="success", icon="plus")]))
         if self.db.active_count(uid) >= self.max_active():
-            return await self.say(u, f"{e('stop')} حداکثر {self.max_active()} تسک فعال مجاز است؛ صبر کنید یکی تمام شود یا لغوش کنید.")
+            return await self.say(u, Doc().p(f"{e('stop')} حداکثر {ltr(self.max_active())} تسک فعال مجاز است؛ صبر کنید یکی تمام شود یا لغوش کنید."))
         c.user_data["state"] = "await_link"
-        await self.say(u, f"{title('link', 'تسک جدید')}\n\nلینک کالکشن OpenSea (یا فقط slug) را بفرستید.\n"
-                          f"<i>مثال:</i> <code>https://opensea.io/collection/aerent</code>",
+        await self.say(u, Doc().h("تسک جدید", "link", 3)
+                       .p(f"لینک کالکشن {lt('OpenSea')} یا فقط {lt('slug')} را بفرستید.")
+                       .table(["نمونهٔ قابل‌قبول"], [[mono("https://opensea.io/collection/aerent")],
+                                                    [mono("https://opensea.io/item/robinhood/0x…/1")], [mono("aerent")]])
+                       .footer("لینک داخل یک متن بلندتر یا پیام فورواردی هم پیدا می‌شود."),
                        kb([btn("انصراف", "xc", style="danger", icon="no")]))
 
     @staticmethod
@@ -528,11 +569,11 @@ class Service:
         uid = u.effective_user.id
         link = self.extract_link(u.message.text)
         if not link:
-            return await self.say(u, f"{e('warn')} این پیام لینک کالکشن نیست. فقط لینک را بفرستید، مثل:\n"
-                                     "<code>https://opensea.io/collection/aerent</code>\n<i>(یا فقط slug مثل aerent)</i>",
+            return await self.say(u, Doc().p(f"{e('warn')} <b>این پیام لینک کالکشن نیست.</b>")
+                                  .p(f"فقط لینک را بفرستید، مثل {mono('https://opensea.io/collection/aerent')} یا فقط {lt('slug')} مثل {lt('aerent')}."),
                                   kb([btn("انصراف", "xc", style="danger", icon="no")]))
         await u.effective_chat.send_action("typing")
-        msg = await self.say(u, f"{e('search')} در حال بررسی دراپ روی OpenSea و زنجیره…")
+        msg = await self.say(u, Doc().p(f"{e('search')} <b>در حال بررسی دراپ</b> روی {lt('OpenSea')} و زنجیره…"))
         try:
             key = self.user_key(uid)
             slug = await self.blocking(self.os.resolve_slug, link, key)
@@ -540,37 +581,41 @@ class Service:
             nft = pf.check_drop(drop)
             await self.blocking(pf.check_chain_contract, nft)
         except (OpenSeaError, pf.PreflightError, VaultError) as ex:
-            return await msg.edit_text(f"{e('no')} {esc(ex)}", parse_mode=ParseMode.HTML,
-                                       reply_markup=kb([btn("انصراف", "xc", style="danger", icon="no")]))
+            return await self.screen(msg, Doc().h("بررسی دراپ ناموفق بود", "no", 3).p(esc(ex)),
+                                     kb([btn("انصراف", "xc", style="danger", icon="no")]))
         stages = pf.pick_stages(drop)
         c.user_data.pop("state", None)
         if not stages:
-            return await msg.edit_text(f"{e('wait')} همهٔ مرحله‌های این دراپ تمام شده‌اند.", parse_mode=ParseMode.HTML)
-        ok_st, lines = [], []
+            return await self.screen(msg, Doc().p(f"{e('wait')} همهٔ مرحله‌های این دراپ تمام شده‌اند."))
+        ok_st, rows, notes = [], [], []
         for s in stages:
             why = pf.unsupported_reason(s)
             lim = pf.stage_wallet_limit(s)
-            lines.append(f"{e('green') if not why else e('stop')} <b>{esc(s['label'])}</b> · {self.kind_fa(s['kind'], s['type'])}\n"
-                         f"     {self.price_fa(s['price_wei'])} · سقف هر ولت: {lim if lim else '?'}\n"
-                         f"     {fmt_ts(s['start'])}"
-                         + (f"\n     ↳ <i>{esc(why)}</i>" if why else ""))
-            if not why:
+            rows.append([f"{e('green') if not why else e('stop')} <b>{lt(s['label'])}</b>",
+                         self.kind_fa(s["kind"], s["type"]), R.price(s["price_wei"]),
+                         ltr(lim) if lim else "؟", f"{R.tm(s['start'])}<br>{R.rel(s['start'])}"])
+            if why:
+                notes.append(f"<b>{lt(s['label'])}:</b> {esc(why)}")
+            else:
                 ok_st.append(s)
         try:
             tot, mx = int(drop.get("total_supply") or 0), int(drop.get("max_supply") or 0)
         except (TypeError, ValueError):
             tot = mx = 0
-        sup = f"{drop.get('total_supply')}/{drop.get('max_supply')}" + (f"  {ui.bar(tot, mx)}" if mx else "")
-        txt = (f"{e('gem')} <b>{esc(drop.get('collection_name') or slug)}</b>\n"
-               f"{ui.kv('قرارداد', ui.code(nft))}\n{ui.kv('عرضه', sup)}\n{ui.SEP}\n" + "\n\n".join(lines))
+        name = drop.get("collection_name") or slug
+        d = (Doc().h(lt(name), "gem", 2)
+             .kv([("قرارداد", mono(nft)), ("شبکه", lt("Robinhood Chain")),
+                  ("عرضه", f"{ltr(f'{tot:,} / {mx:,}')}  {ltr(ui.bar(tot, mx))}" if mx else lt(f"{drop.get('total_supply')}/{drop.get('max_supply')}"))])
+             .table(["مرحله", "نوع", "قیمت", "سقف ولت", "شروع"], rows, caption="مرحله‌ها",
+                    align=["right", "right", "center", "center", "right"]))
+        if notes:
+            d.quote("\n".join(notes))
         if not ok_st:
-            return await msg.edit_text(txt + f"\n\n{e('no')} هیچ مرحلهٔ قابل‌مینتی ندارد.", parse_mode=ParseMode.HTML)
-        c.user_data["plan"] = {"step": "wallet", "slug": slug, "nft": nft, "name": drop.get("collection_name") or slug,
-                               "stages": ok_st}
-        await msg.edit_text(txt + f"\n{ui.SEP}\n{e('coin')} <b>با کدام ولت مینت شود؟</b>\n"
-                                  "<i>ربات برای همان ولت allowlist و سقف هر مرحله را از OpenSea چک می‌کند.</i>",
-                            parse_mode=ParseMode.HTML, reply_markup=self.wallet_pick_kb(uid),
-                            link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return await self.screen(msg, d.p(f"{e('no')} <b>هیچ مرحلهٔ قابل‌مینتی ندارد.</b>"))
+        c.user_data["plan"] = {"step": "wallet", "slug": slug, "nft": nft, "name": name, "stages": ok_st}
+        d.hr().p(f"{e('coin')} <b>با کدام ولت مینت شود؟</b>").footer(
+            f"ربات برای همان ولت {lt('allowlist')} و سقف هر مرحله را از {lt('OpenSea')} چک می‌کند.")
+        await self.screen(msg, d, self.wallet_pick_kb(uid))
 
     def wallet_pick_kb(self, uid):
         rows = [[btn(f"{ui.short(w['address'])}", f"pw:{w['id']}", icon="coin")] for w in self.db.wallets(uid)]
@@ -579,11 +624,11 @@ class Service:
 
     @staticmethod
     def kind_fa(kind, typ=None):
-        return {"signed": "Allowlist (امضادار)", "public": "Public (عمومی)"}.get(kind, esc(typ or "?"))
+        return {"signed": f"{ltr('Allowlist')} (امضادار)", "public": f"{ltr('Public')} (عمومی)"}.get(kind, lt(typ or "?"))
 
     @staticmethod
     def price_fa(p):
-        return "رایگان" if p == 0 else (f"{p / 1e18:.6f} ETH" if p else "?")
+        return R.price(p)
 
     async def plan_wallet(self, u: Update, c):
         """Per-stage pre-check for the chosen wallet: OpenSea eligibility (SIWE) incl. the per-stage wallet cap,
@@ -596,22 +641,25 @@ class Service:
         p = c.user_data.get("plan")
         w = self.db.wallet(uid, int(q.data.split(":")[1]))
         if not (p and w):
-            return await self.say(q.message, f"{e('wait')} {EXPIRED}")
+            return await self.say(q.message, Doc().p(f"{e('wait')} {EXPIRED}"))
         nft, slug = p["nft"], p["slug"]
         if p.get("step") != "wallet":                                # double tap on a wallet button
             return
         p["step"] = "checking"
-        m = await self.show(q, f"{e('search')} <b>پیش‌بررسی ولت</b> {ui.code(ui.short(w['address']))}\n\n"
-                               f"{e('wait')} موجودی و مینت‌های قبلی روی زنجیره\n"
-                               f"{e('wait')} ورود به OpenSea با ولت (SIWE)\n"
-                               f"{e('wait')} allowlist و سقف هر مرحله\n\n<i>چند ثانیه صبر کنید…</i>")
+        chk = lambda a, b, c_: (Doc().h(f"پیش‌بررسی ولت {mono(ui.short(w['address']))}", "search", 3)
+                                .checklist([(a, "موجودی و مینت‌های قبلی روی زنجیره"),
+                                            (b, f"ورود به {lt('OpenSea')} با ولت ({lt('SIWE')})"),
+                                            (c_, f"{lt('allowlist')} و سقف هر مرحله")])
+                                .footer("چند ثانیه صبر کنید…"))
+        m = await self.show(q, chk(False, False, False))
         try:
             bal = await self.blocking(pf.check_wallet, w["address"])
             done = await self.blocking(pf.minted_count, nft, w["address"])
         except pf.PreflightError as ex:
             p["step"] = "wallet"                                     # let the user retry / pick another wallet
-            return await m.edit_text(f"{e('no')} {esc(ex)}\n\n{e('coin')} <b>با کدام ولت مینت شود؟</b>",
-                                     parse_mode=ParseMode.HTML, reply_markup=self.wallet_pick_kb(uid))
+            return await self.screen(m, Doc().p(f"{e('no')} {esc(ex)}").p(f"{e('coin')} <b>با کدام ولت مینت شود؟</b>"),
+                                     self.wallet_pick_kb(uid))
+        m = await self.screen(m, chk(True, False, False))
         pub = None
         if any(s["kind"] == "public" for s in p["stages"]):
             try:
@@ -623,6 +671,7 @@ class Service:
             pk = self.vault.decrypt(uid, w["address"], w["blob"])
             jwt = await self.blocking(self.os.wallet_jwt, pk)
             del pk
+            m = await self.screen(m, chk(True, True, False))
             el = await self.blocking(self.os.eligibility_full, slug, self.user_key(uid), jwt)
         except (OpenSeaError, VaultError) as ex:
             el_err = str(ex)[:80]
@@ -652,24 +701,26 @@ class Service:
         await self.render_select(m, p)
 
     def select_text(self, p):
-        lines = [f"{e('coin')} {ui.code(p['addr'])}\n"
-                 f"{ui.kv('موجودی', ui.eth(p['bal']))} · {ui.kv('مینت‌های قبلی در این کالکشن', p['done'])}\n{ui.SEP}"]
+        d = (Doc().h("انتخاب مرحله‌ها و تعداد", "list", 3)
+             .kv([("ولت", mono(p["addr"])), ("موجودی", R.eth(p["bal"])), ("مینت‌های قبلی در این کالکشن", ltr(p["done"]))]))
+        rows = []
         for s in p["stages"]:
-            elig = {True: f"{e('ok')} allowlist هست", False: f"{e('no')} allowlist نیست"}.get(s["eligible"], f"{e('warn')} allowlist نامعلوم")
+            elig = {True: f"{e('ok')} هست", False: f"{e('no')} نیست"}.get(s["eligible"], f"{e('warn')} نامعلوم")
             if s["kind"] == "public":
-                elig = f"{e('green')} عمومی (allowlist ندارد)" if s["eligible"] is not False else elig
+                elig = f"{e('green')} عمومی" if s["eligible"] is not False else elig
             mark = e("ok") if s["qty"] else (e("stop") if s["why_no"] else e("timer"))
-            lines.append(f"{mark} <b>{esc(s['label'])}</b> · {self.kind_fa(s['kind'])} · {self.price_fa(s['price_wei'])}\n"
-                         f"     {fmt_ts(s['start'])}\n"
-                         f"     {elig} · Limit {s['limit'] if s['limit'] else '?'} per wallet\n     "
-                         + (f"↳ <i>{esc(s['why_no'])}</i>" if s["why_no"] else f"قابل مینت برای شما: حداکثر <b>{s['maxq']}</b>")
-                         + (f"\n     {e('pin')} انتخاب شما: <b>{s['qty']} عدد</b>" if s["qty"] else ""))
+            room = (f"<i>{esc(s['why_no'])}</i>" if s["why_no"] else f"حداکثر <b>{ltr(s['maxq'])}</b>")
+            rows.append([f"{mark} <b>{lt(s['label'])}</b><br>{R.tm(s['start'])}", elig,
+                         lt(f"Limit {s['limit'] if s['limit'] else '?'}"), room,
+                         f"<b>{ltr(s['qty'])}</b>" if s["qty"] else "—"])
+        d.table(["مرحله", lt("allowlist"), "سقف", "قابل مینت", "انتخاب"], rows,
+                align=["right", "center", "center", "right", "center"])
         if p.get("el_err"):
-            lines.append(f"{e('warn')} چک allowlist ممکن نشد ({esc(p['el_err'])})؛ در زمان مینت دوباره چک می‌شود.")
-        lines.append(ui.quote(f"{e('info')} سقف هر ولت <b>جدا برای هر مرحله</b> است (طبق OpenSea): مثلاً Limit 4 در "
-                              "مرحلهٔ اول و Limit 1 در مرحلهٔ دوم یعنی جمعاً ۵ عدد."))
-        lines.append(f"{e('next')} مرحله(ها) را انتخاب و تعداد هرکدام را مشخص کنید، بعد «ادامه».")
-        return "\n".join(lines)
+            d.note(f"چک {lt('allowlist')} ممکن نشد ({lt(p['el_err'])})؛ در زمان مینت دوباره چک می‌شود.", "warn")
+        d.quote(f"{e('info')} سقف هر ولت <b>جدا برای هر مرحله</b> است (طبق {lt('OpenSea')}): مثلاً {lt('Limit 4')} در "
+                f"مرحلهٔ اول و {lt('Limit 1')} در مرحلهٔ دوم یعنی جمعاً ۵ عدد.")
+        d.p(f"{e('next')} مرحله(ها) را انتخاب و تعداد هرکدام را مشخص کنید، بعد «ادامه».")
+        return d
 
     async def render_select(self, msg, p, new=False):
         rows = []
@@ -683,8 +734,10 @@ class Service:
         if any(s["qty"] for s in p["stages"]):
             rows.append([btn("ادامه — خلاصه و تأیید", "pn", style="primary", icon="next")])
         rows.append([btn("انصراف", "px", style="danger", icon="no")])
-        f = msg.reply_text if new else msg.edit_text
-        await f(self.select_text(p), parse_mode=ParseMode.HTML, reply_markup=kb(*rows))
+        if new:
+            await self.say(msg, self.select_text(p), kb(*rows))
+        else:
+            await self.screen(msg, self.select_text(p), kb(*rows))
 
     @staticmethod
     def qty_options(maxq):
@@ -706,7 +759,7 @@ class Service:
             i = int(q.data.split(":")[1]); s = p["stages"][i]
             assert p["step"] in ("select", "qty") and not s["why_no"]
         except (TypeError, KeyError, IndexError, ValueError, AssertionError):
-            return await self.say(q.message, f"{e('wait')} {EXPIRED}")
+            return await self.say(q.message, Doc().p(f"{e('wait')} {EXPIRED}"))
         if s["qty"]:                                             # tap on a selected stage = deselect
             s["qty"] = None
             return await self.render_select(q.message, p)
@@ -718,13 +771,12 @@ class Service:
         if s["maxq"] > 1:
             rows.append([btn("عدد دلخواه", f"pq:{i}:c", icon="edit")])
         rows.append([btn("برگشت", "pb", icon="next")])
-        cost = "" if not s["price_wei"] else f"\n{e('usd')} قیمت هر عدد: {s['price_wei'] / 1e18:.6f} ETH"
-        await q.message.edit_text(
-            f"{e('pin')} <b>{esc(s['label'])}</b>\n\n"
-            f"Limit {lim if lim else '?'} per wallet — سقف هر ولت این مرحله {lim if lim else 'نامشخص'} عدد است.\n"
-            f"حداکثر قابل مینت برای شما در این مرحله: <b>{s['maxq']}</b>{cost}\n\n"
-            f"{e('next')} <b>می‌خواهید در این مرحله چند عدد مینت کنید؟</b>",
-            parse_mode=ParseMode.HTML, reply_markup=kb(*rows))
+        d = (Doc().h(lt(s["label"]), "pin", 3)
+             .kv([("سقف هر ولت در این مرحله", lt(f"Limit {lim or '?'} per wallet")),
+                  ("حداکثر قابل مینت برای شما در این مرحله", f"<b>{ltr(s['maxq'])}</b>"),
+                  ("قیمت هر عدد", R.price(s["price_wei"])), ("شروع", R.when(s["start"]))])
+             .p(f"{e('next')} <b>می‌خواهید در این مرحله چند عدد مینت کنید؟</b>"))
+        await self.show(q, d, kb(*rows))
 
     async def plan_qty(self, u: Update, c):
         q = u.callback_query
@@ -734,11 +786,11 @@ class Service:
             _, i, v = q.data.split(":"); i = int(i); s = p["stages"][i]
             assert p["step"] == "qty" and p.get("qi") == i
         except (TypeError, KeyError, IndexError, ValueError, AssertionError):
-            return await self.say(q.message, f"{e('wait')} {EXPIRED}")
+            return await self.say(q.message, Doc().p(f"{e('wait')} {EXPIRED}"))
         if v == "c":
             c.user_data["state"] = "await_qty"
             p["qmsg"] = q.message.message_id
-            return await self.say(q.message, f"{e('edit')} عدد مورد نظر را بفرستید (۱ تا {s['maxq']}).",
+            return await self.say(q.message, Doc().p(f"{e('edit')} عدد مورد نظر را بفرستید — از {ltr(1)} تا {ltr(s['maxq'])}."),
                                   kb([btn("برگشت", "pb", icon="next")]))
         n = s["maxq"] if v == "max" else int(v)
         if not 1 <= n <= s["maxq"]:
@@ -751,10 +803,10 @@ class Service:
         t = (u.message.text or "").strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
         if not (p and p.get("step") == "qty" and p.get("qi") is not None):
             c.user_data.pop("state", None)
-            return await self.say(u, f"{e('wait')} {EXPIRED}")
+            return await self.say(u, Doc().p(f"{e('wait')} {EXPIRED}"))
         s = p["stages"][p["qi"]]
         if not t.isdigit() or not 1 <= int(t) <= s["maxq"]:
-            return await self.say(u, f"{e('no')} یک عدد بین ۱ و {s['maxq']} بفرستید (یا /cancel).")
+            return await self.say(u, Doc().p(f"{e('no')} یک عدد بین {ltr(1)} و {ltr(s['maxq'])} بفرستید (یا {lt('/cancel')})."))
         s["qty"] = int(t); p["step"] = "select"; p.pop("qi", None)
         c.user_data.pop("state", None)
         await self.render_select(u.message, p, new=True)
@@ -764,7 +816,7 @@ class Service:
         await self.safe_answer(q)
         p = c.user_data.get("plan")
         if not p or "wid" not in p:
-            return await self.say(q.message, f"{e('wait')} {EXPIRED}")
+            return await self.say(q.message, Doc().p(f"{e('wait')} {EXPIRED}"))
         p["step"] = "select"; p.pop("qi", None); c.user_data.pop("state", None)
         await self.render_select(q.message, p)
 
@@ -780,56 +832,63 @@ class Service:
         uid = q.from_user.id
         p = c.user_data.get("plan")
         if not p or p.get("step") != "select" or not any(s["qty"] for s in p["stages"]):
-            return await self.say(q.message, f"{e('wait')} {EXPIRED}")
+            return await self.say(q.message, Doc().p(f"{e('wait')} {EXPIRED}"))
         proj = self.project(p)
         pref = self.db.prefs(uid)
         for s, _ in proj:
             s["min_unit"], s["max_unit"] = self.unit_bounds(s["price_wei"], pref["price_policy"], pref["max_increase_pct"])
         total = sum(s["max_unit"] * s["qty"] for s, _ in proj)
         gas = pf.WARN_BALANCE_WEI * len(proj)
-        lines, ok = [f"{title('list', 'خلاصهٔ برنامهٔ مینت')}\n{e('gem')} {esc(p['name'])}\n"
-                     f"{e('coin')} {ui.code(p['addr'])}\n{ui.SEP}"], True
+        ok = True
+        d = (Doc().h("خلاصهٔ برنامهٔ مینت", "list", 2)
+             .kv([("کالکشن", lt(p["name"])), ("ولت", mono(p["addr"]))]))
+        rows = []
         for n, (s, eff) in enumerate(proj, 1):
             pr, qt = s["price_wei"], s["qty"]
-            cost = "رایگان" if not pr else f"{pr / 1e18:.6f} × {qt} = {pr * qt / 1e18:.6f} ETH"
-            lines.append(f"<b>{n}. {esc(s['label'])}</b> · {self.kind_fa(s['kind'])}\n"
-                         f"     {fmt_ts(s['start'])}\n"
-                         f"     تعداد: <b>{qt}</b> · {cost}")
-            if s["max_unit"] != pr or s["min_unit"] != pr:
-                lines.append(f"     قیمت قابل‌قبول هر عدد: {s['min_unit'] / 1e18:.6f} تا {s['max_unit'] / 1e18:.6f} ETH")
-        lines.append(f"{ui.SEP}\n{e('usd')} <b>جمع قیمت (حداکثر):</b> {total / 1e18:.6f} ETH + گس (~{gas / 1e18:.4f})\n"
-                     f"{e('coin')} <b>موجودی:</b> {p['bal'] / 1e18:.6f} ETH")
+            rows.append([ltr(n), f"<b>{lt(s['label'])}</b><br>{self.kind_fa(s['kind'])}",
+                         f"{R.tm(s['start'])}<br>{R.rel(s['start'])}", f"<b>{ltr(qt)}</b>",
+                         "رایگان" if not pr else ltr(f"{pr / 1e18:.6f} × {qt} = {pr * qt / 1e18:.6f} ETH")])
+        d.table(["#", "مرحله", "شروع", "تعداد", "هزینه"], rows, caption="مرحله‌های انتخاب‌شده",
+                align=["center", "right", "right", "center", "left"])
+        ranges = [(s, s["min_unit"], s["max_unit"]) for s, _ in proj if s["max_unit"] != s["price_wei"] or s["min_unit"] != s["price_wei"]]
+        money = [("جمع قیمت (حداکثر)", f"<b>{R.eth(total)}</b>"), ("گس تقریبی", ltr(f"~{gas / 1e18:.4f} ETH")),
+                 ("موجودی ولت", R.eth(p["bal"]))]
+        money += [(f"قیمت قابل‌قبول {lt(s['label'][:16])}", ltr(f"{lo / 1e18:.6f} – {hi / 1e18:.6f} ETH")) for s, lo, hi in ranges]
+        d.kv(money, caption="هزینه")
+        if total:
+            terms = [f"{R.num(s['max_unit'])} \\times {s['qty']}" for s, _ in proj if s["max_unit"]]
+            d.math(" + ".join(terms) + f" = {R.num(total)}\\ \\mathrm{{ETH}}", "")
         if p["bal"] < total + gas:
-            lines.append(f"{e('warn')} موجودی برای همهٔ برنامه کافی نیست؛ ربات در هر مرحله فقط به اندازهٔ موجودی همان لحظه مینت می‌کند.")
+            d.note("موجودی برای همهٔ برنامه کافی نیست؛ ربات در هر مرحله فقط به اندازهٔ موجودی همان لحظه مینت می‌کند.", "warn")
         last = max(s["start"] for s, _ in proj)
-        lines.append(f"\n{e('gear')} <b>اگر قیمت عوض شد:</b> {self.policy_line(pref)}  <i>(تغییر در «⚙️ تنظیمات»)</i>")
+        checks = [(True, f"<b>اگر قیمت عوض شد:</b> {esc(self.policy_line(pref))} <i>(قابل تغییر در «⚙️ تنظیمات»)</i>")]
         assign = self.db.pick_keys(uid, [{"start": s["start"], "end": s["end"]} for s, _ in proj])
         if any(kid is None for kid, _ in assign):
             ok = False
-            lines.append(f"{e('no')} برای بعضی مرحله‌ها هیچ کلید API معتبری تا زمان شروع ندارید؛ کلید جدید ثبت کنید.")
+            checks.append((False, f"برای بعضی مرحله‌ها هیچ کلید {lt('API')} معتبری تا زمان شروع ندارید؛ کلید جدید ثبت کنید."))
         else:
             labels = {k["id"]: k["label"] or str(k["id"]) for k in self.db.apikeys(uid)}
             shared = sum(1 for _, sh in assign if sh)
-            lines.append(f"{e('lock')} <b>کلید هر مرحله:</b> " + "، ".join(f"{esc(s['label'][:16])} ← {labels.get(kid, kid)}"
-                                                                         for (s, _), (kid, _) in zip(proj, assign)))
-            if shared:
-                lines.append(f"{e('warn')} {shared} مرحله با مرحلهٔ هم‌زمان دیگری کلید مشترک دارد (سهمیهٔ ۵ درخواست مینت OpenSea "
-                             "تقسیم می‌شود). برای کلید اختصاصی کلید بیشتری اضافه کنید.")
+            checks.append((not shared, "<b>کلید هر مرحله:</b> " + "، ".join(f"{lt(s['label'][:16])} ← {lt(labels.get(kid, kid))}"
+                                                                          for (s, _), (kid, _) in zip(proj, assign))
+                           + (f" — {ltr(shared)} مرحله کلید مشترک دارد (سهمیهٔ ۵ درخواست {lt('OpenSea')} تقسیم می‌شود)." if shared else "")))
         usr = self.db.user(uid)
         if usr and usr["sub_until"] < last:
             ok = False
-            lines.append(f"{e('no')} اشتراک شما قبل از شروع آخرین مرحله تمام می‌شود ({fmt_ts(usr['sub_until'])})؛ اول تمدید کنید.")
+            checks.append((False, f"اشتراک شما قبل از شروع آخرین مرحله تمام می‌شود ({R.tm(usr['sub_until'])})؛ اول تمدید کنید."))
+        else:
+            checks.append((True, "اشتراک تا شروع آخرین مرحله معتبر است"))
         if self.db.active_count(uid) + len(proj) > self.max_active():
             ok = False
-            lines.append(f"{e('no')} با این برنامه از سقف {self.max_active()} تسک فعال رد می‌شوید.")
-        lines.append(ui.quote(f"{e('shield')} ربات هرگز بیشتر از «قیمت قابل‌قبول × تعداد» نمی‌پردازد و همیشه همان مبلغی را "
-                              "می‌فرستد که قرارداد می‌خواهد. تعداد فقط ممکن است کمتر شود (سقف ولت / عرضه / موجودی)، هرگز بیشتر."))
+            checks.append((False, f"با این برنامه از سقف {ltr(self.max_active())} تسک فعال رد می‌شوید."))
+        d.h("بررسی نهایی", "shield", 4).checklist(checks)
+        d.quote(f"{e('shield')} ربات هرگز بیشتر از «قیمت قابل‌قبول × تعداد» نمی‌پردازد و همیشه همان مبلغی را "
+                "می‌فرستد که قرارداد می‌خواهد. تعداد فقط ممکن است کمتر شود (سقف ولت / عرضه / موجودی)، هرگز بیشتر.")
+        d.p(f"{e('next')} <b>تأیید می‌کنید؟</b>" if ok else f"{e('stop')} <b>برنامه قابل ثبت نیست.</b>")
         p["step"] = "summary"
         rows = ([[btn("تأیید و مسلح کردن", "pa", style="success", icon="bolt")]] if ok else []) + \
                [[btn("ویرایش", "pb", icon="edit"), btn("انصراف", "px", style="danger", icon="no")]]
-        await q.message.edit_text("\n".join(lines) + (f"\n\n{e('next')} <b>تأیید می‌کنید؟</b>" if ok
-                                                      else f"\n\n{e('stop')} <b>برنامه قابل ثبت نیست.</b>"),
-                                  parse_mode=ParseMode.HTML, reply_markup=kb(*rows))
+        await self.show(q, d, kb(*rows))
 
     async def plan_arm(self, u: Update, c):
         q = u.callback_query
@@ -855,22 +914,24 @@ class Service:
         res = self.db.add_plan(uid, p["wid"], p["slug"], p["nft"], items, self.max_active(), plan_id)
         if res in ("dup", "limit"):
             p["step"] = "summary"
-            return await self.say(q.message, f"{e('stop')} " + ("برای یکی از این مرحله‌ها با این ولت قبلاً تسک فعال دارید."
-                                                                if res == "dup" else "سقف تسک فعال پر است."))
+            return await self.say(q.message, Doc().p(f"{e('stop')} " + ("برای یکی از این مرحله‌ها با این ولت قبلاً تسک فعال دارید."
+                                                                        if res == "dup" else "سقف تسک فعال پر است.")))
         self.db.audit(uid, "plan_add", f"{plan_id} {p['slug']} " + ", ".join(f"{t}:{s['label']}x{s['qty']}" for t, s in zip(res, sel)))
         c.user_data.pop("plan", None)
         rows = []
         for t, s in zip(res, sel):
             prep = "همین الان آماده می‌شود" if s["start"] <= time.time() + self.cfg.spawn_before_s else \
-                f"{self.cfg.spawn_before_s // 60} دقیقه قبل از شروع آماده می‌شود"
-            rows.append(f"{e('bolt')} <b>تسک #{t}</b> · {esc(s['label'])} × {s['qty']}\n     {fmt_ts(s['start'])}\n     <i>{prep}</i>")
+                f"{self.cfg.spawn_before_s // 60} دقیقه قبل از شروع"
+            rows.append([f"<b>{ltr(f'#{t}')}</b>", lt(s["label"]), ltr(s["qty"]), f"{R.tm(s['start'])}<br>{R.rel(s['start'])}", prep])
         try:                                                     # the summary screen becomes a read-only record
             await q.message.edit_reply_markup(kb([btn("ثبت شد", disabled=True, style="success", icon="ok")]))
         except Exception:  # noqa: BLE001
             pass
-        await q.message.reply_text(f"{e('fire')} <b>مسلح شد!</b>\nربات منتظر لحظهٔ شروع هر مرحله می‌ماند و همان لحظه شلیک می‌کند:\n\n"
-                                   + "\n\n".join(rows) + f"\n\n{e('bell')} نتیجهٔ هر مرحله همین‌جا اطلاع داده می‌شود.",
-                                   parse_mode=ParseMode.HTML, reply_markup=self.menu(), message_effect_id=ui.EFFECT_FIRE)
+        d = (Doc().h("مسلح شد!", "fire", 2)
+             .p("ربات منتظر لحظهٔ شروع هر مرحله می‌ماند و <b>همان لحظه شلیک می‌کند</b>.")
+             .table(["تسک", "مرحله", "تعداد", "شروع", "آماده‌سازی"], rows, align=["center", "right", "center", "right", "right"])
+             .footer(f"{e('bell')} نتیجهٔ هر مرحله همین‌جا اطلاع داده می‌شود · «📋 تسک‌ها» برای پیگیری"))
+        await self.say(q.message, d, self.menu(), effect=ui.EFFECT_FIRE)
 
     async def plan_cancel(self, u: Update, c):
         q = u.callback_query
@@ -880,7 +941,7 @@ class Service:
             await q.message.edit_reply_markup(None)
         except Exception:  # noqa: BLE001
             pass
-        await self.say(q.message, f"{e('stop')} لغو شد.", self.menu())
+        await self.say(q.message, Doc().p(f"{e('stop')} <b>لغو شد.</b>"), self.menu())
 
     async def input_cancel(self, u: Update, c):
         """Inline 'cancel' on prompts that wait for typed input (wallet key / API key / link)."""
@@ -892,28 +953,30 @@ class Service:
             await q.message.edit_reply_markup(None)
         except Exception:  # noqa: BLE001
             pass
-        await self.say(q.message, f"{e('stop')} لغو شد.", self.menu())
+        await self.say(q.message, Doc().p(f"{e('stop')} <b>لغو شد.</b>"), self.menu())
 
     async def stale(self, u: Update, c):
         q = u.callback_query
         await self.safe_answer(q)
-        await self.say(q.message, f"{e('info')} این دکمه مربوط به نسخهٔ قبلی است؛ دوباره «🎯 تسک جدید» را بزنید.")
+        await self.say(q.message, Doc().p(f"{e('info')} این دکمه مربوط به نسخهٔ قبلی است؛ دوباره «🎯 تسک جدید» را بزنید."))
 
     # ------------------------------------------------------------------ settings
     def settings_view(self, uid):
         pref = self.db.prefs(uid)
-        txt = (f"{title('gear', 'تنظیمات')}\n\n{e('usd')} <b>واکنش به تغییر قیمت</b>\n"
-               "<i>اگر سازنده هنگام شروع یا حین مینت قیمت را عوض کند:</i>\n"
-               f"{e('pin')} فعلی: <b>{esc(self.policy_line(pref))}</b>\n\n"
-               + ui.quote(
-                   "<b>فقط همان قیمت</b> — هر تغییری ← هیچ تراکنشی ارسال نمی‌شود (امن‌ترین).\n"
-                   "<b>کمتر شد مینت کن</b> — ارزان‌تر شد ← مینت، گران‌تر شد ← بیخیال.\n"
-                   "<b>تا سقف ٪</b> — تا درصدی که تعیین می‌کنید گران‌تر هم مینت می‌کند؛ ارزان‌تر شدن ← بیخیال.\n"
-                   "<b>هر تغییری تا سقف ٪</b> — ارزان‌تر یا گران‌تر (تا سقف) ← مینت.", expandable=True)
-               + f"\n{e('shield')} ربات همیشه دقیقاً همان مبلغی را می‌فرستد که قرارداد می‌خواهد و هرگز بیشتر از سقف. "
-               "تنظیم روی برنامه‌هایی اعمال می‌شود که از این به بعد مسلح می‌کنید.\n\n"
-               f"{e('chart')} سقف تسک فعال: {self.max_active()}")
         cur = pref["price_policy"]
+        pct = pref["max_increase_pct"]
+        rows_ = [(k, f"{e('ok') if cur == k else e('timer')} <b>{esc(POLICY_SHORT[k])}</b>", desc) for k, desc in (
+            ("exact", "هر تغییری ← هیچ تراکنشی ارسال نمی‌شود (امن‌ترین)"),
+            ("lower_ok", "ارزان‌تر شد ← مینت · گران‌تر شد ← بیخیال"),
+            ("cap", f"تا {ltr(f'+{pct}%') if cur == 'cap' else 'درصد تعیین‌شده'} گران‌تر هم مینت · ارزان‌تر ← بیخیال"),
+            ("any_up", f"ارزان‌تر یا گران‌تر تا {ltr(f'+{pct}%') if cur == 'any_up' else 'سقف'} ← مینت (ریسک بالاتر)"))]
+        txt = (Doc().h("تنظیمات", "gear", 2)
+               .h("واکنش به تغییر قیمت", "usd", 4)
+               .p("اگر سازنده هنگام شروع یا حین مینت قیمت را عوض کند، ربات چه کند؟")
+               .table(["حالت", "رفتار"], [[a, b] for _, a, b in rows_], align=["right", "right"])
+               .kv([("فعلی", f"<b>{esc(self.policy_line(pref))}</b>"), ("سقف تسک فعال", ltr(self.max_active()))])
+               .note("ربات همیشه دقیقاً همان مبلغی را می‌فرستد که قرارداد می‌خواهد و هرگز بیشتر از سقف. "
+                     "تنظیم روی برنامه‌هایی اعمال می‌شود که از این به بعد مسلح می‌کنید.", "shield"))
         mk = lambda key, label: (btn(label, f"cp:{key}", style="success", icon="ok") if cur == key
                                  else btn(label, f"cp:{key}"))
         rows = [[mk("exact", "فقط همان قیمت"), mk("lower_ok", "کمتر شد مینت کن")],
@@ -964,28 +1027,32 @@ class Service:
     def tasks_view(self, uid):
         ts = self.db.tasks(uid)
         if not ts:
-            return (f"{title('list', 'تسک‌های شما')}\n\n{e('info')} هنوز تسکی ندارید. لینک کالکشن را بفرستید یا «🎯 تسک جدید» را بزنید.",
+            return (Doc().h("تسک‌های شما", "list", 2)
+                    .p(f"{e('info')} هنوز تسکی ندارید. لینک کالکشن را بفرستید یا «🎯 تسک جدید» را بزنید."),
                     kb([btn("تسک جدید", "nt", style="primary", icon="bolt")]))
         act = [t for t in ts if t["status"] in ("scheduled", "running")]
         done = [t for t in ts if t["status"] not in ("scheduled", "running")][:8]
-        lines = [f"{title('list', 'تسک‌های شما')}  <i>({len(act)} فعال)</i>"]
+        minted = sum(1 for t in ts if t["status"] == "minted")
+        d = Doc().h("تسک‌های شما", "list", 2).kv([("فعال", ltr(len(act))), ("موفق (۲۰ تسک اخیر)", ltr(minted))])
         rows = []
         for group, head in ((act, "فعال"), (done, "اخیر")):
             if not group:
                 continue
-            lines.append(f"\n<b>{head}</b>")
+            trs = []
             for t in group:
                 ic, lab = STATUS.get(t["status"], ("info", t["status"]))
-                lines.append(f"{e(ic)} <b>#{t['id']}</b> {esc(t['slug'])} · {esc(t['stage_label'])} × {t['quantity']}\n"
-                             f"     {lab} · {fmt_ts(t['start_ts'])}")
+                trs.append(["<b>" + ltr("#" + str(t["id"])) + "</b>",
+                            f"{lt(t['slug'])}<br>{lt(t['stage_label'])} × {ltr(t['quantity'])}",
+                            f"{e(ic)} {lab}", f"{R.tm(t['start_ts'], 'd')}<br>{R.rel(t['start_ts'])}"])
                 row = [btn(f"#{t['id']} جزئیات", f"td:{t['id']}", icon="search")]
                 if t["status"] in ("scheduled", "running"):
                     row.append(btn(f"لغو #{t['id']}", f"tcq:{t['id']}", style="danger", icon="stop"))
                 elif t["tx_hash"]:
                     row.append(btn("تراکنش", url=ui.tx_url(t["tx_hash"]), icon="link"))
                 rows.append(row)
+            d.table(["#", "کالکشن / مرحله", "وضعیت", "شروع"], trs, caption=head, align=["center", "right", "right", "right"])
         rows.append([btn("بروزرسانی", "tl", icon="refresh")])
-        return "\n".join(lines), kb(*rows)
+        return d, kb(*rows)
 
     async def tasks(self, u: Update, c):
         uid = u.effective_user.id
@@ -1006,13 +1073,13 @@ class Service:
             return await self.show(q, *self.tasks_view(q.from_user.id))
         ic, lab = STATUS.get(t["status"], ("info", t["status"]))
         w = self.db.wallet(t["user_id"], t["wallet_id"])
-        lines = [f"{e(ic)} <b>تسک #{t['id']}</b> — {lab}", ui.SEP,
-                 ui.kv("کالکشن", esc(t["slug"])), ui.kv("مرحله", f"{esc(t['stage_label'])} · {self.kind_fa(t['kind'])}"),
-                 ui.kv("تعداد", t["quantity"]), ui.kv("شروع", fmt_ts(t["start_ts"]))]
-        if w:
-            lines.append(ui.kv("ولت", ui.code(w["address"])))
+        d = (Doc().h("تسک " + ltr("#" + str(t["id"])) + f" — {lab}", ic, 3)
+             .kv([("کالکشن", lt(t["slug"])), ("مرحله", f"{lt(t['stage_label'])} · {self.kind_fa(t['kind'])}"),
+                  ("تعداد", ltr(t["quantity"])), ("شروع", R.when(t["start_ts"])),
+                  ("ولت", mono(w["address"])) if w else None,
+                  ("تراکنش", mono(t["tx_hash"][:10] + "…" + t["tx_hash"][-6:])) if t["tx_hash"] else None]))
         if t["result"]:
-            lines.append("\n" + ui.quote(esc(t["result"]), expandable=len(t["result"]) > 200))
+            d.details("نتیجه", f"<p>{esc(t['result']).replace(chr(10), '<br>')}</p>", open_=True)
         rows = []
         if t["tx_hash"]:
             rows.append([btn("مشاهده در اکسپلورر", url=ui.tx_url(t["tx_hash"]), icon="search"),
@@ -1020,7 +1087,7 @@ class Service:
         if t["status"] in ("scheduled", "running"):
             rows.append([btn("لغو این تسک", f"tcq:{t['id']}", style="danger", icon="stop")])
         rows.append([btn("برگشت به لیست", "tl", icon="next")])
-        await self.show(q, "\n".join(lines), kb(*rows))
+        await self.show(q, d, kb(*rows))
 
     async def task_cancel_ask(self, u: Update, c):
         q = u.callback_query
@@ -1029,8 +1096,10 @@ class Service:
         if not t or t["user_id"] != q.from_user.id or t["status"] not in ("scheduled", "running"):
             await self.alert(q, "این تسک دیگر قابل لغو نیست.")
             return await self.show(q, *self.tasks_view(q.from_user.id))
-        await self.show(q, f"{e('warn')} <b>لغو تسک #{t['id']}؟</b>\n{esc(t['slug'])} · {esc(t['stage_label'])} × {t['quantity']}\n"
-                           f"{fmt_ts(t['start_ts'])}\n\nبعد از لغو، ربات برای این مرحله شلیک نمی‌کند.",
+        await self.show(q, Doc().h("لغو تسک " + ltr("#" + str(t["id"])) + "؟", "warn", 3)
+                        .kv([("کالکشن", lt(t["slug"])), ("مرحله", f"{lt(t['stage_label'])} × {ltr(t['quantity'])}"),
+                             ("شروع", R.when(t["start_ts"]))])
+                        .p("بعد از لغو، ربات برای این مرحله <b>شلیک نمی‌کند</b>."),
                         kb([btn("بله، لغو کن", f"tc:{t['id']}", style="danger", icon="stop"),
                             btn("نه، برگرد", "tl", icon="next")]))
 
@@ -1039,8 +1108,9 @@ class Service:
         await self.safe_answer(q)
         tid = int(q.data.split(":")[1])
         ok = await self.blocking(self.runner.cancel, q.from_user.id, tid)
-        txt, mk = self.tasks_view(q.from_user.id)
-        await self.show(q, (f"{e('ok')} تسک #{tid} لغو شد.\n\n" if ok else f"{e('info')} تسک #{tid} قابل لغو نیست.\n\n") + txt, mk)
+        d, mk = self.tasks_view(q.from_user.id)
+        head = Doc().p(f"{e('ok')} <b>تسک {ltr(f'#{tid}')} لغو شد.</b>" if ok else f"{e('info')} تسک {ltr(f'#{tid}')} قابل لغو نیست.")
+        await self.show(q, head.extend(d), mk)
 
     async def new_task_cb(self, u: Update, c):
         q = u.callback_query
@@ -1073,16 +1143,14 @@ class Service:
                 "summary": "برنامه هنوز ثبت نشده؛ «تأیید و مسلح کردن» یا «انصراف» را بزنید",
                 "arming": "در حال ثبت برنامه…"}.get(step)
         if hint:
-            return await self.say(u, f"{e('info')} {hint} (یا /cancel).")
+            return await self.say(u, Doc().p(f"{e('info')} {hint} (یا {lt('/cancel')})."))
         # a pasted private key outside the flow: delete it anyway
         if len(t) in (64, 66) and all(ch in "0123456789abcdefABCDEFx" for ch in t):
             try:
                 await u.message.delete()
             except Exception:  # noqa: BLE001
                 pass
-            return await u.effective_chat.send_message(
-                f"{e('siren')} پیام شبیه کلید خصوصی بود و <b>پاک شد</b>. برای ثبت ولت از «👛 ولت‌ها» اقدام کنید.",
-                parse_mode=ParseMode.HTML)
+            return await self.say(u, Doc().p(f"{e('siren')} پیام شبیه کلید خصوصی بود و <b>پاک شد</b>. برای ثبت ولت از «👛 ولت‌ها» اقدام کنید."))
         # A pasted OpenSea link (or forwarded text with one) starts a new task directly
         if self.extract_link(t) and ("opensea.io" in t.lower()):
             uid = u.effective_user.id
@@ -1091,7 +1159,7 @@ class Service:
                     and self.db.active_count(uid) < self.max_active():
                 return await self.got_link(u, c)
             return await self.new_task(u, c)
-        await self.say(u, f"{e('info')} از دکمه‌های منو استفاده کنید یا لینک کالکشن OpenSea را بفرستید.", self.menu())
+        await self.say(u, Doc().p(f"{e('info')} از دکمه‌های منو استفاده کنید یا لینک کالکشن {lt('OpenSea')} را بفرستید."), self.menu())
 
     # ------------------------------------------------------------------ admin
     def is_admin(self, u):
@@ -1199,9 +1267,9 @@ class Service:
         log.error("handler error: %s: %s", type(c.error).__name__, str(c.error)[:300], exc_info=c.error)
         try:
             if update and getattr(update, "effective_chat", None):
-                await c.bot.send_message(update.effective_chat.id,
-                                         f"{e('warn')} <b>مشکلی پیش آمد</b> — لطفاً دوباره تلاش کنید.\n"
-                                         "<i>اگر تکرار شد /cancel بزنید و از اول شروع کنید.</i>", parse_mode=ParseMode.HTML)
+                await R.send(c.bot, update.effective_chat.id,
+                             Doc().p(f"{e('warn')} <b>مشکلی پیش آمد</b> — لطفاً دوباره تلاش کنید.")
+                             .footer(f"اگر تکرار شد {lt('/cancel')} بزنید و از اول شروع کنید."))
         except Exception:  # noqa: BLE001
             pass
 

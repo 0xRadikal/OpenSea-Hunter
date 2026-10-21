@@ -28,7 +28,43 @@ class _Check(html.parser.HTMLParser):
         self.stack.pop()
 
 
+class _RichCheck(_Check):
+    """Rich-HTML subset of Bot API 10.3 (tags used by service/rich.py, per core.telegram.org/bots/api#rich-html-style)."""
+    OK = _Check.OK | {"p", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "br", "ul", "ol", "li", "input", "table", "caption",
+                      "tr", "td", "th", "details", "summary", "aside", "footer", "cite", "tg-math", "tg-math-block",
+                      "mark", "sub", "sup"}
+    VOID = {"hr", "br", "input"}
+    BLOCK = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "ul", "ol", "table", "details", "aside", "footer", "blockquote",
+             "tg-math-block"}
+
+    def __init__(self):
+        super().__init__()
+        self.top = []
+
+    def handle_starttag(self, tag, attrs):
+        assert tag in self.OK, tag
+        if not self.stack:
+            self.top.append(tag)
+        if tag not in self.VOID:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        assert tag in self.VOID, tag
+        if not self.stack:
+            self.top.append(tag)
+
+    def handle_data(self, data):
+        assert self.stack or not data.strip(), f"text outside any block: {data!r}"
+
+
 def valid_html(s):
+    from service.rich import Doc
+    if isinstance(s, Doc):
+        r = _RichCheck(); r.feed(s.html()); r.close()
+        assert not r.stack, r.stack
+        assert all(t in _RichCheck.BLOCK for t in r.top), r.top        # every top-level node is a block
+        assert len(s.html()) <= 32768 and len(r.top) <= 500
+        s = s.classic()
     p = _Check(); p.feed(s); p.close()
     assert not p.stack, p.stack
     return True
@@ -111,20 +147,30 @@ def test_safebot_does_not_retry_unrelated_errors(monkeypatch):
 
 def test_result_card_minted_and_failed():
     t = {"id": 7, "slug": "naz<ism>", "stage_label": "Public & co"}
-    st, detail = classify({"minted": True, "tx": "0x" + "ab" * 32, "token_ids": [4], "wanted": 1,
-                           "speed": {"api_win": 0.3, "sent": 0.4, "receipt": 0.6, "rank": 2}})
-    txt, mk = result_card(t, st, detail, {"tx": "0x" + "ab" * 32})
-    assert valid_html(txt) and "naz&lt;ism&gt;" in txt and "Public &amp; co" in txt and "tx: " not in txt
+    res = {"minted": True, "tx": "0x" + "ab" * 32, "token_ids": [4, 5], "wanted": 3,
+           "speed": {"api_win": 0.3, "sent": 0.4, "receipt": 0.6, "rank": 2, "block": 10, "tx_index": 0, "block_delta": 0,
+                     "unit_price": 10 ** 15}}
+    st, detail = classify(res)
+    d, mk = result_card(t, st, detail, res)
+    h = d.html()
+    assert valid_html(d) and "naz&lt;ism&gt;" in h and "Public &amp; co" in h and "tx: " not in h
+    assert "\u2066+0.400 s\u2069" in h and "#2" in h and "\u2066#4, #5\u2069" in h and "از \u20663\u2069 درخواستی" in h
+    assert "0.001000 ETH" in h and "<table" in h and "معیار رقابت نیست" not in h
     btns = [b for row in mk.to_dict()["inline_keyboard"] for b in row]
     assert btns[0]["url"].endswith("/tx/0x" + "ab" * 32) and btns[1]["copy_text"]["text"] == "0x" + "ab" * 32
     assert btns[2]["url"] == "https://opensea.io/collection/naz<ism>"
-    txt, mk = result_card(t, "failed", "قیمت عوض شد <script>", {})
-    assert valid_html(txt) and "&lt;script&gt;" in txt and mk is None
+    late = dict(res, speed={"late_start": 64.2, "own_api_win": 0.04, "own_sent": 0.05, "own_receipt": 0.26, "rank": 3,
+                            "block": 11, "tx_index": 1})
+    d, _ = result_card(t, *classify(late), late)
+    assert valid_html(d) and "معیار رقابت نیست" in d.html() and "\u206664\u2069 ث بعد از شروع" in d.html()
+    d, mk = result_card(t, "failed", "قیمت عوض شد <script>", {})
+    assert valid_html(d) and "&lt;script&gt;" in d.html() and "<script>" not in d.classic() and mk is None
 
 
 def test_bot_screens_render_valid_html(tmp_path):
     """Every screen builder returns Telegram-valid HTML (balanced, whitelisted tags) — premium on and off."""
     from service.bot import Service
+    from service.rich import Doc
     from service.config import Config
     from service.vault import create_master_key
     cfg = Config(); cfg.data_dir = str(tmp_path / "d"); cfg.master_key_file = str(tmp_path / "m.key")
@@ -136,12 +182,13 @@ def test_bot_screens_render_valid_html(tmp_path):
         ui.PREMIUM = premium
         for txt, _ in (svc.wallets_view(uid), svc.key_menu(uid), svc.settings_view(uid), svc.tasks_view(uid)):
             assert valid_html(txt), txt
-        assert valid_html(svc.progress_card(uid)[1])
+        assert valid_html(Doc().checklist(svc.progress_card(uid)[1]))
         p = {"addr": "0x" + "1" * 40, "bal": 10 ** 16, "done": 0, "el_err": "x<y", "stages": [
             {"label": "OG <List>", "kind": "signed", "price_wei": 0, "start": 1800000000, "eligible": True, "limit": 2,
              "why_no": None, "maxq": 2, "qty": 1},
             {"label": "Pub", "kind": "public", "price_wei": 10 ** 15, "start": 1800003600, "eligible": False, "limit": 1,
              "why_no": "طبق OpenSea این ولت در allowlist این مرحله نیست", "maxq": 0, "qty": None}]}
         txt = svc.select_text(p)
-        assert valid_html(txt) and "OG &lt;List&gt;" in txt and "x&lt;y" in txt
-    assert re.search(r"tg-emoji", svc.select_text(p)) is None    # last loop iteration ran with premium off
+        assert valid_html(txt) and "OG &lt;List&gt;" in txt.html() and "x&lt;y" in txt.html()
+        assert "OG &lt;List&gt;" in txt.classic() and "<List>" not in txt.html()
+    assert re.search(r"tg-emoji", svc.select_text(p).html()) is None    # last loop iteration ran with premium off
