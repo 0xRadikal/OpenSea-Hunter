@@ -1499,10 +1499,11 @@ class Service:
             log.warning("profile setup skipped: %s", type(ex).__name__)
 
     async def _post_shutdown(self, app):
-        for name in ("_runner_task", "_ton_task"):
-            t = getattr(self, name, None)
-            if t:
-                t.cancel()
+        tasks = [t for t in (getattr(self, "_runner_task", None), getattr(self, "_ton_task", None)) if t]
+        for t in tasks:
+            t.cancel()
+        # wait for the cancellations to finish so no pending inner awaitable is destroyed at exit
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def main():
