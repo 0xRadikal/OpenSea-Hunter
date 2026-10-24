@@ -693,8 +693,16 @@ def main():
     if WALLET_CAP_FN:
         try:
             box = {}
-            th = threading.Thread(target=lambda: box.setdefault("v", WALLET_CAP_FN(STAGE_LABEL)), daemon=True)
+
+            def _cap():
+                try:
+                    box["v"] = WALLET_CAP_FN(STAGE_LABEL)
+                except Exception as e:  # noqa: BLE001 — thread errors must be logged, not dumped as a traceback
+                    box["err"] = mask(f"{type(e).__name__}: {str(e)[:80]}")
+            th = threading.Thread(target=_cap, daemon=True)
             th.start(); th.join(25)
+            if box.get("err"):
+                log(f"eligibility cap read failed ({box['err']})")
             if box.get("v") is not None:
                 limit, cap_src = int(box["v"]), "OpenSea eligibility"
         except Exception as e:  # noqa: BLE001
