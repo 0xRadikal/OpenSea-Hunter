@@ -70,6 +70,14 @@ API_MAX_QTY = 100                   # OpenSea /mint accepts quantity 1..100 (doc
 # charged. So a max tip costs nothing extra; it is set only so no possible tip-based ordering is missed.
 PRIO_EQUALS_MAXFEE = True
 MAX_BROADCASTS = 4                  # hard cap on gas-spending txs
+# Public fast path: a mintPublic call needs NO signature from OpenSea. Its calldata is fully determined by
+# (nft, feeRecipient, minter, quantity); verified byte-for-byte against 3 real OpenSea-built mainnet txs
+# (tasks 1, 2, 11). So it is built locally and SIMULATED on-chain with a block-time override (eth_call
+# state override "time", supported by rpc.mainnet + drpc, verified 2026-10-24) before T0; at T0 the engine
+# skips the OpenSea round trip (0.2-0.6 s measured) and sends immediately. Any doubt -> normal OpenSea path.
+FAST_PUBLIC = True
+OS_FEE_RECIPIENT = "0x0000a26b00c1f0df003000390027140000faa719"   # OpenSea fee recipient in every mint seen
+OS_SUFFIX = "3d958fe2"                                             # OpenSea attribution suffix (4 bytes, ignored by ABI)
 FIRE_GUARD_S = 0.20                 # wall >= startTime + guard (sequencer clock measured <=0.165 s behind)
 # hedged wave: (offset seconds after T0, key index)
 WAVE = [(0.030, 0), (0.180, 0)]       # 2 mint calls at T0; key #1 is failover only (OpenSea: extra keys != throughput)
@@ -427,6 +435,15 @@ def nft_balance(me):
         return -1                                        # unknown; callers treat < 1 as 'not held'
 
 
+SEADROP_ERRORS = {   # selector (keccak256(signature)[:4]) -> (name, RESULT reason); verified against eth_utils.keccak
+    "e12d2314": ("MintQuantityExceedsMaxSupply (sold out)", "sold_out"),
+    "edc01273": ("MintQuantityExceedsMaxMintedPerWallet", "wallet_limit"),
+    "13da22f2": ("NotActive (outside the stage time window)", None),
+    "0d35e921": ("IncorrectPayment (price changed)", "price_changed"),
+    "f477d26f": ("FeeRecipientNotAllowed", None),
+    "900bb2c9": ("SignatureAlreadyUsed", None),
+}
+
 _STAGE_RE = re.compile(r"active drop stage, '([^']+)'")
 
 
@@ -468,6 +485,55 @@ def onchain_public_drop():
 
 def onchain_public_price():
     return onchain_public_drop()[:3]
+
+
+def allowed_fee_recipients():
+    sel = "0x" + keccak(text="getAllowedFeeRecipients(address)")[:4].hex()
+    x = rr("eth_call", [{"to": SD, "data": sel + NFT[2:].lower().rjust(64, "0")}, "latest"], tries=3)
+    return [a.lower() for a in abi_decode(["address[]"], bytes.fromhex(x[2:]))[0]]
+
+
+def public_calldata_local(me, q):
+    sel = SEL_PUBLIC
+    return sel + abi_encode(["address", "address", "address", "uint256"],
+                            [to_checksum_address(NFT), to_checksum_address(OS_FEE_RECIPIENT), me, q]).hex() + OS_SUFFIX
+
+
+def simulate_at(me, data, value, ts):
+    """eth_call as if the block timestamp were `ts` (state-override 'time'). -> (ok, revert data / error)."""
+    last = None
+    for u in READ_RPCS:
+        try:
+            r = rpc("eth_call", [{"from": me, "to": SD, "data": data, "value": hex(value)}, "latest", {}, {"time": hex(int(ts))}],
+                    url=u, timeout=4)
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:80]; continue
+        if "result" in r:
+            return True, ""
+        err = r.get("error") or {}
+        if err.get("code") == 3 or "revert" in str(err.get("message", "")).lower():
+            return False, str(err.get("data") or err.get("message"))[:140]      # authoritative: the call reverted
+        last = str(err)[:120]                                                   # e.g. override unsupported -> next RPC
+    return False, f"unavailable: {last}"
+
+
+def prepare_fast_public(me, q, t0, t_end):
+    """-> (data, value) if a locally built mintPublic is PROVEN valid for block time t0, else (None, reason).
+    Every condition must hold; the normal OpenSea path is used otherwise."""
+    p_, st_, en_, pmpw = onchain_public_drop()
+    if st_ != int(t0):
+        return None, f"on-chain public start {st_} != stage start {int(t0)}"
+    if not (en_ > t0 and en_ <= t_end + 1):
+        return None, f"on-chain public end {en_} does not match stage end {t_end}"
+    if not unit_ok(p_) or p_ * q > MAX_VALUE_WEI:
+        return None, f"on-chain public price {p_} outside policy {unit_range()}"
+    if OS_FEE_RECIPIENT not in allowed_fee_recipients():
+        return None, "OpenSea fee recipient not allowed on-chain"
+    data = public_calldata_local(me, q)
+    ok, why = simulate_at(me, data, p_ * q, int(t0))
+    if not ok:
+        return None, f"simulation at T0 failed: {why}"
+    return (data, p_ * q), None
 
 
 def api_stage_times(apikey):
@@ -695,6 +761,14 @@ def main():
     acct.sign_transaction({"to": to_checksum_address(SD), "value": 0, "data": "0x00", "nonce": nonce, "chainId": CHAIN_ID,
                            "gas": gas, "type": 2, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": PRIO})  # warm-up, never sent
     log("connections warm, waiting for T0")
+    fast = None
+    if FAST_PUBLIC and MINT_KIND == "public" and a.arm:
+        try:
+            fast, why = prepare_fast_public(me, QUANTITY, T0, T_END)
+        except Exception as e:  # noqa: BLE001
+            fast, why = None, f"error {str(e)[:60]}"
+        log(f"FAST PATH ready: local mintPublic simulated OK at T0 (value {fast[1]})" if fast
+            else f"fast path off ({why}) -> OpenSea path")
 
     # ---- T0: hedged wave
     state = {"tx": None, "inflight": 0, "last_err": "", "not_on_list": 0}
@@ -750,11 +824,26 @@ def main():
                     state["no_more"] = state.get("no_more", 0) + 1
             log(f"{tag} API {code} in {ms:.0f} ms rem={rem}: {msg}")
 
+    if fast:
+        # last cheap re-check ~0.6 s before T0: price / window still the same on-chain (an exact-payment contract:
+        # a later price change can only make the tx revert, never overpay)
+        precise_sleep_until(T0 - 0.6)
+        try:
+            p2, st2, en2, _ = onchain_public_drop()
+            if st2 != int(T0) or p2 * QUANTITY != fast[1]:
+                log(f"fast path cancelled: on-chain drop changed (start {st2}, price {p2}) -> OpenSea path"); fast = None
+        except Exception as e:  # noqa: BLE001
+            log(f"fast path cancelled: re-check failed ({str(e)[:60]}) -> OpenSea path"); fast = None
     precise_sleep_until(T0)
     log(">>> T0")
     TIMING["t0"] = T0
     t_fire = time.time()
     TIMING["fire"] = t_fire
+    if fast:
+        state["tx"] = {"to": SD, "data": fast[0], "value": str(fast[1]), "_value": fast[1], "_fast": True}
+        TIMING["api_win"] = time.time()
+        win.set()
+        log("FAST PATH: no OpenSea call needed (pre-built + pre-simulated mintPublic)")
     for i, (off, kidx) in enumerate(WAVE):
         if win.wait(max(0.0, t_fire + off - time.time())):     # wakes instantly on a win
             break
@@ -816,7 +905,9 @@ def main():
         RESULT["reason"] = "price_changed"
         log("value/price policy mismatch — refusing"); return
     RESULT["unit_price"] = VALUE // QUANTITY
-    if tx["data"][:10].lower() == SEL_PUBLIC:
+    if tx.get("_fast"):
+        st_, en_ = int(T0), T_END                        # proven by the T0 simulation + T-0.6 s re-check
+    elif tx["data"][:10].lower() == SEL_PUBLIC:
         p_, st_, en_, pmpw = onchain_public_drop()
         # mintPublic is checked on-chain against the PUBLIC drop's cumulative cap (numMinted + qty <= pmpw);
         # if that is certain to fail, sending only burns gas on a revert.
@@ -926,6 +1017,11 @@ def main():
             if settle_from_receipts("before stopping") or target_held(me):
                 log("*** wallet holds the NFT (confirmed before stopping) ***"); return
             low = err.lower()
+            known = next((v for k, v in SEADROP_ERRORS.items() if k in low), None)
+            if known:                                     # decoded SeaDrop custom error (selectors keccak-verified)
+                if known[1]:
+                    RESULT["reason"] = known[1]
+                log(f"revert: {known[0]} — will not fix itself, stopping."); return
             # 0xc0e1b4c5 etc. are custom errors; stop on anything that will not change by retrying
             if any(x in low for x in ("exceeds", "maxsupply", "max_supply", "invalid signature", "signatureal", "notactive")):
                 log("revert reason will not fix itself — stopping."); return
