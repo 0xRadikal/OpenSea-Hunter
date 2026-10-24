@@ -29,10 +29,10 @@ def make_cap_fn(pk, api_key, slug, stage_uuid, base):
     message is signed). Returns None on any failure -> engine does not pre-clamp."""
     def cap(_label):
         sys.path.insert(0, HERE)
-        from service.opensea import OpenSea
+        from service.opensea import OpenSea, norm_uuid
         o = OpenSea(base, timeout=8)
         jwt = o.wallet_jwt(pk, tries=2)
-        e = o.eligibility_full(slug, api_key, jwt).get(stage_uuid) or {}
+        e = o.eligibility_full(slug, api_key, jwt).get(norm_uuid(stage_uuid)) or {}
         return e.get("cap") if e.get("eligible") else None
     return cap
 

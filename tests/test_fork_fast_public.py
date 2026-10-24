@@ -113,3 +113,31 @@ def test_fast_path_cancelled_when_price_changes_before_t0(env):
     th.join()
     assert "FAST PATH ready" in out and "fast path cancelled: on-chain drop changed" in out, out[-2500:]
     assert res["holds"] == 0 and fu.nonce(a.address) == 0, out[-2500:]            # normal path also refuses
+
+
+def test_soldout_revert_is_decoded(env):
+    """Like live task #10: supply is free at T-45 s but the drop sells out right after T0 (rivals were faster).
+    The tx reverts on-chain -> the engine must report 'sold_out' (decoded MintQuantityExceedsMaxSupply)."""
+    from eth_utils import keccak
+    from eth_abi import encode
+    fo = env
+    fu.r("anvil_setTime", [int(time.time())]); fu.r("evm_mine", [])
+    now = int(time.time()); fu.set_public_drop(0, now - 60, now + 3600, max_per_wallet=1000)
+    a, pk = fu.funded_wallet()
+    set_max = lambda n: fu.r("eth_sendTransaction", [{"from": fu.OWNER, "to": fu.NFT, "gas": hex(200000),
+                             "data": "0x" + keccak(text="setMaxSupply(uint256)")[:4].hex() + encode(["uint256"], [n]).hex()}])
+    t0 = time.time() + 4
+    sent = {}
+
+    def opensea(m):                                   # OpenSea answers; meanwhile the drop sells out (owner caps supply)
+        fu.r("anvil_impersonateAccount", [fu.OWNER])
+        total = int(fu.r("eth_call", [{"to": fu.NFT, "data": "0x18160ddd"}, "latest"]), 16)
+        sent["h"] = set_max(total); fu.r("evm_mine", [])
+        return 200, {"to": fu.SD, "data": fu.public_calldata(m), "value": "0", "chain": "robinhood"}
+    fo.mint["so"] = opensea
+    try:
+        out, res = run(fo, pk, "so", 0, 0, t0)
+        assert res["minted"] is False and res["reason"] == "sold_out", out[-2500:]
+        assert "MintQuantityExceedsMaxSupply" in out, out[-2500:]
+    finally:
+        fu.r("anvil_impersonateAccount", [fu.OWNER]); set_max(1000); fu.r("evm_mine", [])

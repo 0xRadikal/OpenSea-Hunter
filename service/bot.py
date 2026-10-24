@@ -25,7 +25,7 @@ from .rich import Doc, lt, ltr, mono
 from .ui import btn, e, kb, title, when
 from .config import Config
 from .db import DB
-from .opensea import OpenSea, OpenSeaError
+from .opensea import OpenSea, OpenSeaError, norm_uuid
 from .runner import Runner
 from . import ton_pay as TP
 from .vault import Vault, VaultError, load_master_key, normalize_private_key
@@ -823,7 +823,7 @@ class Service:
             s["note"] = None
             if s["kind"] == "public" and pub and s["price_wei"] > 0 and pub[0] != s["price_wei"]:
                 s["note"] = f"قیمت روی زنجیره ({pub[0] / 1e18:.6f}) با OpenSea فرق دارد"
-            el_s = el.get(s["uuid"]) or {}
+            el_s = el.get(norm_uuid(s["uuid"])) or {}
             s["eligible"] = el_s.get("eligible") if el_s else (True if s["kind"] == "public" else None)
             s["cap"] = el_s.get("cap")                                  # absolute cap for THIS wallet in THIS stage
             if s["cap"] is not None:

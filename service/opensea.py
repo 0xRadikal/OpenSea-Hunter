@@ -30,6 +30,13 @@ class OpenSeaError(Exception):
         self.status = status
 
 
+def norm_uuid(u):
+    """Stage uuid in ONE canonical form. Verified live 2026-10-24: /drops/{slug} returns some stage uuids WITHOUT
+    dashes (offbody, zumi-shoes) while /drops/{slug}/eligibility always returns them WITH dashes -> a raw string
+    compare never matched (allowlist shown 'unknown', per-wallet cap not read)."""
+    return str(u or "").replace("-", "").strip().lower()
+
+
 def parse_link(text):
     """-> ("slug", slug) or ("contract", (chain, address)). Accepts bare slugs and opensea.io URLs."""
     t = (text or "").strip()
@@ -169,7 +176,7 @@ class OpenSea:
         out = {}
         for st in body.get("stages", []):
             cap, pr = str(st.get("max_total_mintable_by_wallet") or ""), str(st.get("price") or "")
-            out[str(st.get("stage_uuid"))] = {"eligible": bool(st.get("is_eligible")),
+            out[norm_uuid(st.get("stage_uuid"))] = {"eligible": bool(st.get("is_eligible")),
                                               "cap": int(cap) if cap.isdigit() else None,
                                               "price": int(pr) if pr.isdigit() else None}
         return out
