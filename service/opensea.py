@@ -30,6 +30,13 @@ class OpenSeaError(Exception):
         self.status = status
 
 
+def norm_uuid(u):
+    """Stage uuid in ONE canonical form. Verified live 2026-10-24: /drops/{slug} returns some stage uuids WITHOUT
+    dashes (offbody, zumi-shoes) while /drops/{slug}/eligibility always returns them WITH dashes -> a raw string
+    compare never matched (allowlist shown 'unknown', per-wallet cap not read)."""
+    return str(u or "").replace("-", "").strip().lower()
+
+
 def parse_link(text):
     """-> ("slug", slug) or ("contract", (chain, address)). Accepts bare slugs and opensea.io URLs."""
     t = (text or "").strip()
@@ -158,5 +165,18 @@ class OpenSea:
 
     def eligibility(self, slug, key, jwt):
         """-> {stage_uuid: is_eligible}"""
+        return {u: v["eligible"] for u, v in self.eligibility_full(slug, key, jwt).items()}
+
+    def eligibility_full(self, slug, key, jwt):
+        """-> {stage_uuid: {"eligible": bool, "cap": int|None, "price": int|None}}.
+        cap = max_total_mintable_by_wallet: the ABSOLUTE per-wallet total OpenSea will sign for this wallet in that
+        stage (live 2026-10-21: 4 minted in stage x + public limit 1 -> public cap "5"). SeaDrop checks
+        numMinted + qty <= cap, so allowance = cap - numMinted."""
         body = self._get(f"/api/v2/drops/{slug}/eligibility", key, jwt)
-        return {str(st.get("stage_uuid")): bool(st.get("is_eligible")) for st in body.get("stages", [])}
+        out = {}
+        for st in body.get("stages", []):
+            cap, pr = str(st.get("max_total_mintable_by_wallet") or ""), str(st.get("price") or "")
+            out[norm_uuid(st.get("stage_uuid"))] = {"eligible": bool(st.get("is_eligible")),
+                                              "cap": int(cap) if cap.isdigit() else None,
+                                              "price": int(pr) if pr.isdigit() else None}
+        return out
